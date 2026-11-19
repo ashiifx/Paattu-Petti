@@ -43,10 +43,12 @@ def _cookiefile():
     """
     raw = os.environ.get("YT_COOKIES", "").strip()
     if not raw:
+        log.warning("YT_COOKIES env var is NOT set — extraction is cookieless")
         return None
     if not os.path.exists(_COOKIE_PATH):
         with open(_COOKIE_PATH, "w") as fh:
             fh.write(raw)
+        log.info("YT_COOKIES present (%d chars) — wrote cookie file", len(raw))
     return _COOKIE_PATH
 
 
