@@ -35,6 +35,37 @@ def _extract(query_or_url: str, opts: dict):
         raise YoutubeError(str(exc)[:300]) from exc
 
 
+# YouTube flags datacenter IPs (Render, most VPS hosts) with
+# "Sign in to confirm you're not a bot" — but mostly for the default web
+# client. The TV / Android / embedded app clients are usually let through,
+# so stream resolution rotates through them before giving up.
+_CLIENT_SETS = [
+    ["android_vr"],
+    ["tv"],
+    ["ios"],
+    ["web_embedded"],
+    ["web_safari"],
+    ["android"],
+    None,  # yt-dlp default, last resort
+]
+
+
+def _extract_resilient(query_or_url: str, opts: dict):
+    """_extract with YouTube player-client rotation (for stream resolution)."""
+    last_error = None
+    for clients in _CLIENT_SETS:
+        attempt = dict(opts)
+        if clients:
+            attempt["extractor_args"] = {
+                "youtube": {"player_client": clients}
+            }
+        try:
+            return _extract(query_or_url, attempt)
+        except YoutubeError as exc:
+            last_error = exc
+    raise last_error or YoutubeError("Could not extract that song.")
+
+
 def track_from_info(info: dict, requester_id: int, requester_name: str,
                     dedication=None) -> Track:
     """Build a Track from a yt-dlp info dict. Pure — unit-testable."""
@@ -69,7 +100,7 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
 
 def track_from_url(url: str, requester_id: int, requester_name: str,
                    dedication=None) -> Track:
-    info = _extract(url, {})
+    info = _extract_resilient(url, {})
     if info.get("_type") == "playlist":
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
@@ -100,12 +131,49 @@ def playlist_tracks(url: str, limit: int, requester_id: int,
     return tracks
 
 
+def _soundcloud_stream(title: str):
+    """Fallback: find the song on SoundCloud (no bot wall there) and
+    return a direct stream URL, or None."""
+    try:
+        info = _extract(f"scsearch1:{title}", {"noplaylist": True})
+    except YoutubeError:
+        return None
+    entries = info.get("entries") or []
+    if not entries:
+        return None
+    top = entries[0]
+    try:
+        full = _extract(top.get("webpage_url") or top.get("url"), {})
+    except YoutubeError:
+        return None
+    formats = [f for f in (full.get("formats") or []) if f.get("url")]
+    if not formats:
+        return None
+    # Prefer a plain progressive file over HLS when both exist.
+    progressive = [f for f in formats
+                   if "m3u8" not in (f.get("protocol") or "")
+                   and "m3u8" not in f.get("url", "")]
+    chosen = progressive[-1] if progressive else formats[-1]
+    return chosen["url"]
+
+
 def resolve_stream(track: Track) -> Track:
     """Fetch the direct audio URL for a track (mutates and returns it)."""
     target = track.webpage_url or track.video_id
     if not target:
         raise YoutubeError("Track has no YouTube reference to stream from.")
-    info = _extract(target, {"format": _AUDIO_FORMAT})
+    try:
+        info = _extract_resilient(target, {"format": _AUDIO_FORMAT})
+    except YoutubeError:
+        # YouTube is fully blocked from this host — try SoundCloud instead.
+        fallback_url = _soundcloud_stream(track.title)
+        if not fallback_url:
+            raise
+        import time
+        track.stream_url = fallback_url
+        track.stream_resolved_at = time.time()
+        track.source = "soundcloud"
+        return track
     url = info.get("url")
     if not url:
         formats = [f for f in (info.get("formats") or []) if f.get("url")]
