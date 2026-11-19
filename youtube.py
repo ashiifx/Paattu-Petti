@@ -96,6 +96,21 @@ def _cookiefile():
     return _COOKIE_PATH
 
 
+import threading
+
+_YDL_INIT_LOCK = threading.Lock()
+
+
+def _make_ydl(opts: dict):
+    """Build a YoutubeDL instance under a lock: yt-dlp's plugin
+    registration (the bgutil PO-token provider) is process-global
+    and races when two threads construct instances at once
+    ('PoTokenProvider already registered'). Construction is fast —
+    the extraction that follows stays parallel."""
+    with _YDL_INIT_LOCK:
+        return yt_dlp.YoutubeDL(opts)
+
+
 def _extract(query_or_url: str, opts: dict, use_cookies: bool = False):
     merged = {**_BASE_OPTS, **opts}
     if use_cookies:
@@ -103,7 +118,7 @@ def _extract(query_or_url: str, opts: dict, use_cookies: bool = False):
         if cookiefile:
             merged.setdefault("cookiefile", cookiefile)
     try:
-        with yt_dlp.YoutubeDL(merged) as ydl:
+        with _make_ydl(merged) as ydl:
             return ydl.extract_info(query_or_url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         raise YoutubeError(str(exc)[:300]) from exc
@@ -175,7 +190,7 @@ def _raw_formats(url: str, clients, use_cookies: bool) -> str:
         if cookiefile:
             opts["cookiefile"] = cookiefile
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _make_ydl(opts) as ydl:
             info = ydl.extract_info(url, download=False, process=False)
     except Exception as exc:
         return f"EXTRACT FAIL {str(exc)[:110]}"
@@ -299,17 +314,42 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
     server IPs and is strongest for Indian music), then SoundCloud
     (also server-friendly; carries much of the English catalog Saavn
     lacks), then YouTube as the last resort (bot-walled from this
-    host, kept for hosts where it works)."""
-    saavn_tracks = []
-    try:
-        import saavn
-        saavn_tracks = saavn.search_tracks(query, limit, requester_id,
-                                           requester_name, dedication)
-        if saavn_tracks and _saavn_confident(query, saavn_tracks[0]):
-            return saavn_tracks
-    except Exception:
-        log.warning("Saavn search failed; trying other sources",
-                    exc_info=True)
+    host, kept for hosts where it works).
+
+    Saavn runs first on its own — its API answers in about a second
+    and a confident Saavn hit shouldn't wait on yt-dlp. Only when
+    Saavn isn't trusted do SoundCloud and YouTube get searched, and
+    those two run CONCURRENTLY instead of stacking their latency.
+    The trust rules that run over the results are unchanged."""
+    import concurrent.futures
+
+    def _from_saavn():
+        try:
+            import saavn
+            return saavn.search_tracks(query, limit, requester_id,
+                                       requester_name, dedication)
+        except Exception:
+            log.warning("Saavn search failed; trying other sources",
+                        exc_info=True)
+            return []
+
+    def _from_sc():
+        try:
+            return _soundcloud_search_tracks(query, limit, requester_id,
+                                             requester_name, dedication)
+        except YoutubeError:
+            return []
+
+    def _from_yt():
+        try:
+            return _youtube_search_tracks(query, limit, requester_id,
+                                          requester_name, dedication)
+        except YoutubeError:
+            return []
+
+    saavn_tracks = _from_saavn()
+    if saavn_tracks and _saavn_confident(query, saavn_tracks[0]):
+        return saavn_tracks
     if config.DEEZER_ARL:
         # Deezer: real originals incl. the English catalog Saavn lacks,
         # and guaranteed playable (no DRM trap) once an ARL is set.
@@ -322,32 +362,57 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
         except Exception:
             log.warning("Deezer search failed; trying other sources",
                         exc_info=True)
-    try:
-        sc_tracks = _soundcloud_search_tracks(query, limit, requester_id,
-                                              requester_name, dedication)
-        if sc_tracks:
-            if not saavn_tracks or _clearly_famous(sc_tracks[0],
-                                                    saavn_tracks[0]):
-                return sc_tracks
-            return saavn_tracks
-    except YoutubeError:
-        pass
-    try:
-        yt_tracks = _youtube_search_tracks(query, limit, requester_id,
-                                           requester_name, dedication)
-        if yt_tracks:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_sc = pool.submit(_from_sc)
+        f_yt = pool.submit(_from_yt)
+        sc_tracks = f_sc.result()
+        yt_tracks = f_yt.result()
+    if sc_tracks:
+        winner = sc_tracks[0]
+        if 0 < (winner.duration or 0) <= 95 and yt_tracks and \
+                (yt_tracks[0].duration or 0) > winner.duration + 60:
+            # SoundCloud's winner is a preview-length listing and
+            # YouTube has the full song — go straight to YouTube
+            # instead of paying a SoundCloud extraction at resolve
+            # time to learn it's a snippet.
             if not saavn_tracks or _clearly_famous(yt_tracks[0],
                                                     saavn_tracks[0]):
                 return yt_tracks
             return saavn_tracks
-    except YoutubeError:
-        pass
+        if not saavn_tracks or _clearly_famous(winner,
+                                                saavn_tracks[0]):
+            return sc_tracks
+        return saavn_tracks
+    if yt_tracks:
+        if not saavn_tracks or _clearly_famous(yt_tracks[0],
+                                                saavn_tracks[0]):
+            return yt_tracks
+        return saavn_tracks
     # Last resort: Saavn's weak hit (often a cover for English queries)
     # still beats an error in a listening group.
     if saavn_tracks:
         return saavn_tracks
     return _youtube_search_tracks(query, limit, requester_id,
                                   requester_name, dedication)
+
+
+_SEARCH_CACHE: dict = {}
+
+
+def _search_extract(search_url: str) -> dict:
+    """_extract for ytsearch/scsearch URLs, memoised for 2 minutes —
+    the resolve step often re-searches what the search step just
+    searched (the SoundCloud preview/DRM fallbacks), and a repeated
+    group request shouldn't pay the extraction twice."""
+    now = time.time()
+    hit = _SEARCH_CACHE.get(search_url)
+    if hit and now - hit[0] < 120:
+        return hit[1]
+    info = _extract(search_url, {"noplaylist": True, "extract_flat": True})
+    if len(_SEARCH_CACHE) > 64:
+        _SEARCH_CACHE.clear()
+    _SEARCH_CACHE[search_url] = (now, info)
+    return info
 
 
 def _soundcloud_search_tracks(query: str, limit: int, requester_id: int,
@@ -361,8 +426,7 @@ def _soundcloud_search_tracks(query: str, limit: int, requester_id: int,
     hit blindly kept serving random singers. If even the best-ranked
     candidate is a tagged version, SoundCloud is rejected entirely
     and the caller falls through to YouTube."""
-    info = _extract(f"scsearch{max(limit, 8)}:{query}",
-                    {"noplaylist": True, "extract_flat": True})
+    info = _search_extract(f"scsearch{max(limit, 8)}:{query}")
     tracks = []
     for e in (info.get("entries") or []):
         if not e:
@@ -393,8 +457,7 @@ def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
     from the search API; the real extraction happens later, in
     resolve_stream.
     """
-    info = _extract(f"ytsearch{max(limit, 5)}:{query}",
-                    {"noplaylist": True, "extract_flat": True})
+    info = _search_extract(f"ytsearch{max(limit, 5)}:{query}")
     entries = info.get("entries") or []
     tracks = []
     for e in entries:
@@ -722,7 +785,7 @@ def _download_youtube_file(track: Track) -> None:
         if cookiefile:
             opts["cookiefile"] = cookiefile
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with _make_ydl(opts) as ydl:
                 ydl.download([url])
         except Exception as exc:
             errors.append(f"{label}: {str(exc)[:90]}")
@@ -825,9 +888,18 @@ def _youtube_fallback_for(track: Track, longer_than: int = 0) -> Track:
     yt = _youtube_search_tracks(
         f"{track.title} {track.uploader}".strip(), 5,
         track.requester_id, track.requester_name, track.dedication)
-    pick = _closest_to_original(yt, track)
-    if longer_than and (pick.duration or 0) <= longer_than + 60:
-        raise YoutubeError("YouTube has no substantially longer version")
+    if longer_than:
+        # The reference duration is a PREVIEW length, so "closest to
+        # the original" is meaningless — it picked a 3:35 edit of a
+        # 4:25 song for being nearer to 90s. Rank by originality and
+        # views instead: the full album version wins.
+        pick = _rank_originals(
+            yt, f"{track.title} {track.uploader}")[0]
+        if (pick.duration or 0) <= longer_than + 60:
+            raise YoutubeError(
+                "YouTube has no substantially longer version")
+    else:
+        pick = _closest_to_original(yt, track)
     resolved = resolve_stream(pick)
     track.stream_url = resolved.stream_url
     # The tunnel path DOWNLOADS instead of returning a URL — without
