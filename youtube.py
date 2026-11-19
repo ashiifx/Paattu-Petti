@@ -981,27 +981,33 @@ def resolve_stream(track: Track) -> Track:
                        if "m3u8" not in (f.get("protocol") or "")
                        and "m3u8" not in f.get("url", "")]
         chosen = progressive[-1] if progressive else formats[-1]
-        # SoundCloud stream URLs are minted for the extracting IP —
-        # under the tunnel that's the WARP egress, so the player
-        # fetching one directly gets silence (the watchdog's
-        # dead-stream skips). Download the file through the same
-        # route and stream it locally, exactly like YouTube tracks.
+        # Download the track with yt-dlp and stream the local file.
+        # SoundCloud now serves most tracks as HLS: the format URL is
+        # a playlist whose segment URLs are minted for the extracting
+        # IP (the tunnel's), so the player fetching them directly
+        # gets silence — and a playlist is not a file you can save
+        # with one GET either. yt-dlp downloads HLS properly through
+        # the same proxy route.
+        import glob
         try:
             cache = os.path.join(config.DOWNLOAD_DIR, "soundcloud")
             os.makedirs(cache, exist_ok=True)
-            dest = os.path.join(
-                cache, f"{track.video_id or 'sc'}.{chosen.get('ext') or 'mp3'}")
-            if not (os.path.exists(dest) and _validate_file(dest)):
-                status, _, data = _http_get(
-                    chosen["url"], chosen.get("http_headers") or {},
-                    None, timeout=60)
-                if status != 200 or len(data) < 100_000:
-                    raise YoutubeError(f"SC download HTTP {status}")
-                with open(dest, "wb") as fh:
-                    fh.write(data)
-                if not _validate_file(dest):
-                    raise YoutubeError("SC download was not valid audio")
-            track.file_path = dest
+            stem = os.path.join(cache, track.video_id or "sc")
+            existing = [p for p in glob.glob(stem + ".*")
+                        if _validate_file(p)]
+            if existing:
+                track.file_path = existing[0]
+            else:
+                dl_opts = {**_BASE_OPTS, "format": "bestaudio/best",
+                           "outtmpl": stem + ".%(ext)s",
+                           "noplaylist": True, "overwrites": True}
+                with _make_ydl(dl_opts) as ydl:
+                    ydl.download([track.webpage_url])
+                got = [p for p in glob.glob(stem + ".*")
+                       if _validate_file(p)]
+                if not got:
+                    raise YoutubeError("yt-dlp produced no valid file")
+                track.file_path = got[0]
             track.stream_resolved_at = time.time()
             _prune_youtube_cache(cache)
             return track
