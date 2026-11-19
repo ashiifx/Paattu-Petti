@@ -48,7 +48,23 @@ def _cookiefile():
     if not os.path.exists(_COOKIE_PATH):
         with open(_COOKIE_PATH, "w") as fh:
             fh.write(raw)
-        log.info("YT_COOKIES present (%d chars) — wrote cookie file", len(raw))
+        # Validate the Netscape format: real cookie lines are TAB-separated
+        # with 7 fields. If the text was copied through a chat app or web
+        # page, the tabs get eaten and yt-dlp silently loads ZERO cookies —
+        # extraction then behaves exactly like having no cookies at all.
+        valid = 0
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if len(line.split("\t")) >= 7:
+                valid += 1
+        log.info("YT_COOKIES present (%d chars, %d valid cookie lines)",
+                 len(raw), valid)
+        if valid == 0:
+            log.warning("YT_COOKIES has NO valid cookie lines — the tabs "
+                        "were probably stripped while copying. Re-paste "
+                        "directly from the cookies.txt file.")
     return _COOKIE_PATH
 
 
@@ -83,9 +99,19 @@ _CLIENT_SETS = [
 
 
 def _extract_resilient(query_or_url: str, opts: dict):
-    """_extract with YouTube player-client rotation (for stream resolution)."""
+    """_extract with YouTube player-client rotation (for stream resolution).
+
+    With account cookies attached, the plain web client is the one that
+    uses the session properly, so it goes first; without cookies, the
+    app clients (android_vr, tv, ...) are the best bet against the
+    datacenter-IP bot wall.
+    """
+    if _cookiefile():
+        client_sets = [["web"], ["web_safari"], ["mweb"]] + _CLIENT_SETS
+    else:
+        client_sets = _CLIENT_SETS
     last_error = None
-    for clients in _CLIENT_SETS:
+    for clients in client_sets:
         attempt = dict(opts)
         if clients:
             attempt["extractor_args"] = {
@@ -198,6 +224,8 @@ def resolve_stream(track: Track) -> Track:
     target = track.webpage_url or track.video_id
     if not target:
         raise YoutubeError("Track has no YouTube reference to stream from.")
+    log.info("resolving stream for %r (cookies=%s)",
+             track.title, bool(_cookiefile()))
     try:
         info = _extract_resilient(target, {"format": _AUDIO_FORMAT})
     except YoutubeError:
