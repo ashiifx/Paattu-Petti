@@ -677,6 +677,8 @@ async def main():
 
     os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
 
+    youtube._cookiefile()  # eager cookie check — status lands in the deploy log
+
     bot = Client("paattu_petti_bot", api_id=config.API_ID,
                  api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
     assistant = Client("paattu_petti_assistant", api_id=config.API_ID,

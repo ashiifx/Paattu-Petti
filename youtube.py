@@ -44,6 +44,7 @@ def _cookiefile():
     raw = os.environ.get("YT_COOKIES", "").strip()
     if not raw:
         log.warning("YT_COOKIES env var is NOT set — extraction is cookieless")
+        print("YT_COOKIES check: NOT SET", flush=True)
         return None
     if not os.path.exists(_COOKIE_PATH):
         with open(_COOKIE_PATH, "w") as fh:
@@ -61,6 +62,8 @@ def _cookiefile():
                 valid += 1
         log.info("YT_COOKIES present (%d chars, %d valid cookie lines)",
                  len(raw), valid)
+        print(f"YT_COOKIES check: {len(raw)} chars, {valid} valid cookie "
+              f"lines", flush=True)
         if valid == 0:
             log.warning("YT_COOKIES has NO valid cookie lines — the tabs "
                         "were probably stripped while copying. Re-paste "
