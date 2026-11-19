@@ -5,9 +5,14 @@ Only metadata + direct stream URLs are extracted; nothing is downloaded
 (except tracks the owner replies to in chat, which Telegram delivers itself).
 """
 
+import logging
+import os
+
 import yt_dlp
 
 from queuestate import Track
+
+log = logging.getLogger(__name__)
 
 
 class YoutubeError(Exception):
@@ -24,10 +29,34 @@ _BASE_OPTS = {
 
 _AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 
+_COOKIE_PATH = "/tmp/yt_cookies.txt"
+
+
+def _cookiefile():
+    """Write the YT_COOKIES env var (a Netscape cookies.txt export from a
+    logged-in YouTube session) to disk once and return its path.
+
+    This is the reliable cure for YouTube's datacenter-IP bot wall: with a
+    real account's cookies, extraction works from hosting IPs. Use a
+    throwaway Google account — cookies expire every few weeks and must be
+    re-exported when songs start failing again.
+    """
+    raw = os.environ.get("YT_COOKIES", "").strip()
+    if not raw:
+        return None
+    if not os.path.exists(_COOKIE_PATH):
+        with open(_COOKIE_PATH, "w") as fh:
+            fh.write(raw)
+    return _COOKIE_PATH
+
 
 def _extract(query_or_url: str, opts: dict):
+    merged = {**_BASE_OPTS, **opts}
+    cookiefile = _cookiefile()
+    if cookiefile:
+        merged.setdefault("cookiefile", cookiefile)
     try:
-        with yt_dlp.YoutubeDL({**_BASE_OPTS, **opts}) as ydl:
+        with yt_dlp.YoutubeDL(merged) as ydl:
             return ydl.extract_info(query_or_url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         raise YoutubeError(str(exc)[:300]) from exc
@@ -60,8 +89,12 @@ def _extract_resilient(query_or_url: str, opts: dict):
                 "youtube": {"player_client": clients}
             }
         try:
-            return _extract(query_or_url, attempt)
+            info = _extract(query_or_url, attempt)
+            log.info("extract ok via client=%s", clients or "default")
+            return info
         except YoutubeError as exc:
+            log.warning("extract failed via client=%s: %s",
+                        clients or "default", str(exc)[:160])
             last_error = exc
     raise last_error or YoutubeError("Could not extract that song.")
 
@@ -166,7 +199,10 @@ def resolve_stream(track: Track) -> Track:
         info = _extract_resilient(target, {"format": _AUDIO_FORMAT})
     except YoutubeError:
         # YouTube is fully blocked from this host — try SoundCloud instead.
+        log.warning("YouTube blocked; trying SoundCloud for %r", track.title)
         fallback_url = _soundcloud_stream(track.title)
+        log.warning("SoundCloud fallback result: %s",
+                    "got a stream" if fallback_url else "nothing")
         if not fallback_url:
             raise
         import time
