@@ -1,0 +1,11 @@
+# Paattu Petti — pinned, verified to install & import together on Python 3.12
+# NOTE: kurigram (the maintained Pyrogram fork) replaces vanilla pyrogram —
+# py-tgcalls 3.x imports GroupcallForbidden, which only the fork provides.
+kurigram==2.2.27
+py-tgcalls==3.0.1
+ntgcalls==3.0.7
+yt-dlp==2026.10.26
+
+# Optional: TgCrypto speeds up Pyrogram's crypto a lot. Needs a C compiler
+# to build on some systems; the bot works fine without it.
+# TgCrypto==1.2.5
