@@ -56,6 +56,14 @@ def _cookiefile():
     throwaway Google account — cookies expire every few weeks and must be
     re-exported when songs start failing again.
     """
+    if config.YT_VIA_WARP:
+        # Under the WARP tunnel, cookies are poison: the spare account
+        # is flagged, and with its cookies attached YouTube serves
+        # storyboard-only responses even through the tunnel. Verified
+        # live: the boot probe (cookieless) got real audio while /play
+        # (cookies attached) hit the storyboard wall minutes later.
+        # The tunnel replaces the need for cookies entirely.
+        return None
     raw = os.environ.get("YT_COOKIES", "").strip()
     if not raw:
         log.warning("YT_COOKIES env var is NOT set — extraction is cookieless")
