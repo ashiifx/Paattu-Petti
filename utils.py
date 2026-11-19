@@ -89,12 +89,31 @@ def votes_needed(participant_count) -> int:
 _DEDICATION_RE = re.compile(r"^(?P<query>.*?)\s+for\s+(?P<who>@[\w.]+)\s*$", re.IGNORECASE)
 
 
+_DEDICATION_RE = re.compile(r"^(?P<query>.*?)\s+for\s+(?P<who>@[\w.]+)\s*$", re.IGNORECASE)
+# Bare-name dedications ("/play malare for adhi") — people in a group
+# chat rarely type the @. A single trailing word only: anything longer
+# is treated as part of a song title ("Song For Two People"), and a
+# word that commonly ends a title ("Waiting For You") never counts.
+_DEDICATION_BARE_RE = re.compile(
+    r"^(?P<query>.*?)\s+for\s+(?P<who>[A-Za-z][A-Za-z]*)\s*$",
+    re.IGNORECASE)
+_DEDICATION_STOP = {"you", "me", "us", "her", "him", "them", "it",
+                     "ever", "now", "love", "life", "the", "a", "an"}
+
+
 def parse_dedication(text: str):
-    """'/play kesariya for @adhi' -> ('kesariya', '@adhi'); no match -> (text, None)."""
+    """'/play kesariya for @adhi' -> ('kesariya', '@adhi');
+    '/play malare for adhi' -> ('malare', 'adhi'); no match -> (text, None)."""
     text = (text or "").strip()
     match = _DEDICATION_RE.match(text)
     if match and match.group("query").strip():
         return match.group("query").strip(), match.group("who")
+    match = _DEDICATION_BARE_RE.match(text)
+    if match and match.group("query").strip():
+        who = match.group("who").strip()
+        if who.lower() not in _DEDICATION_STOP and \
+                who.split()[-1].lower() not in _DEDICATION_STOP:
+            return match.group("query").strip(), who
     return text, None
 
 

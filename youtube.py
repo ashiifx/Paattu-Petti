@@ -26,6 +26,10 @@ _BASE_OPTS = {
     "noplaylist": True,
     "socket_timeout": 15,
     "retries": 2,
+    # YouTube scores IPv6 blocks (/64) as one unit and judges them far
+    # more harshly — a frequent "works on my laptop, fails on the VPS"
+    # cause. Laptops sit behind IPv4 NAT; force the same here.
+    "force_ipv4": True,
     # Node is installed in the Docker image (for the PO-token server);
     # yt-dlp needs a JS runtime enabled to solve YouTube's player
     # challenges for the web clients. Harmless where node is absent.
@@ -97,6 +101,8 @@ def _extract(query_or_url: str, opts: dict, use_cookies: bool = False):
 # so stream resolution rotates through them before giving up.
 _CLIENT_SETS = [
     ["android_vr"],
+    ["tv_downgraded"],
+    ["web_creator"],
     ["tv"],
     ["ios"],
     ["web_embedded"],
@@ -409,6 +415,22 @@ def resolve_stream(track: Track) -> Track:
             info = _extract(track.webpage_url, {})
         except YoutubeError as exc:
             if "DRM" in str(exc):
+                # Last resort before giving up: the same song on
+                # YouTube. From this host YouTube is IP-walled so it
+                # fails fast — but from a trusted IP (home connection,
+                # cleaner host) this is exactly how these songs play.
+                try:
+                    yt = _youtube_search_tracks(
+                        f"{track.title} {track.uploader}".strip(), 1,
+                        track.requester_id, track.requester_name,
+                        track.dedication)
+                    resolved = resolve_stream(yt[0])
+                    track.stream_url = resolved.stream_url
+                    track.stream_resolved_at = resolved.stream_resolved_at
+                    track.source = "youtube"
+                    return track
+                except Exception:
+                    pass
                 raise YoutubeError(
                     f"🔒 **{track.title}** — the original is DRM-locked "
                     "on SoundCloud (only its own app may play it), and "

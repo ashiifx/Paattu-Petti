@@ -150,10 +150,12 @@ def register_bot_handlers(bot, player, guess, battle, poll, store):
             os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
             path = os.path.join(config.DOWNLOAD_DIR,
                                 f"{chat_id}_{reply.id}{ext}")
-            try:
-                await reply.download(file_name=path)
-            except Exception:
-                await message.reply("That file download failed 😅 try again?")
+            if not await _download_media(reply, player, path):
+                await message.reply(
+                    "That file download failed 😅 If this group has "
+                    "**Restrict saving content** on, I can't download "
+                    "files at all — a group admin can turn that off in "
+                    "group settings.")
                 return
             from queuestate import Track
             track = Track(
@@ -210,6 +212,32 @@ def register_bot_handlers(bot, player, guess, battle, poll, store):
             return
         await status_msg.delete()
         await _enqueue_and_reply(message, player, track)
+
+    async def _download_media(reply, player_, path) -> bool:
+        """Download a replied audio file, with retries and an assistant
+        fallback. Every failure is logged with its real exception —
+        a silent 'try again' hid the cause for too long."""
+        def _ok():
+            return os.path.exists(path) and os.path.getsize(path) > 0
+
+        for attempt in range(2):
+            try:
+                await reply.download(file_name=path)
+                if _ok():
+                    return True
+            except Exception:
+                log.warning("media download attempt %s failed (bot)",
+                            attempt + 1, exc_info=True)
+        try:
+            msg = await player_.assistant.get_messages(reply.chat.id,
+                                                       reply.id)
+            await player_.assistant.download_media(msg, file_name=path)
+            if _ok():
+                return True
+        except Exception:
+            log.warning("media download failed (assistant too)",
+                        exc_info=True)
+        return False
 
     async def _enqueue_and_reply(message, player_, track):
         chat_id = message.chat.id
