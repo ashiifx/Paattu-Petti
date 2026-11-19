@@ -405,11 +405,26 @@ def resolve_stream(track: Track) -> Track:
         return track
     if track.source == "soundcloud":
         import time
-        stream = _soundcloud_page_stream(track.webpage_url)
-        if not stream:
+        try:
+            info = _extract(track.webpage_url, {})
+        except YoutubeError as exc:
+            if "DRM" in str(exc):
+                raise YoutubeError(
+                    f"🔒 **{track.title}** — the original is DRM-locked "
+                    "on SoundCloud (only its own app may play it), and "
+                    "YouTube is blocked from this server. I can't play "
+                    "the original of this one right now.")
             raise YoutubeError(
                 "Could not get a playable stream from SoundCloud.")
-        track.stream_url = stream
+        formats = [f for f in (info.get("formats") or []) if f.get("url")]
+        if not formats:
+            raise YoutubeError(
+                "Could not get a playable stream from SoundCloud.")
+        progressive = [f for f in formats
+                       if "m3u8" not in (f.get("protocol") or "")
+                       and "m3u8" not in f.get("url", "")]
+        chosen = progressive[-1] if progressive else formats[-1]
+        track.stream_url = chosen["url"]
         track.stream_resolved_at = time.time()
         return track
     target = track.webpage_url or track.video_id

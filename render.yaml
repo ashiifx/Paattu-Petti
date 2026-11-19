@@ -13,3 +13,5 @@ services:
         sync: false
       - key: SESSION_STRING
         sync: false
+      - key: YT_COOKIES
+        sync: false

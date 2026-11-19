@@ -75,10 +75,34 @@ class PlayerManager:
             self._cancel_leave(chat_id)
             if state.current is None:
                 state.start_track(track, hidden=hidden)
-                await self._play_current(chat_id, state)
+                await self._play_or_advance(chat_id, state)
                 return "playing", 0
             position = state.enqueue(track)
             return "queued", position
+
+    async def _play_or_advance(self, chat_id: int, state: ChatState):
+        """Play state.current; if it fails to start (dead/DRM stream),
+        skip forward until something plays. Raises the first error only
+        when every candidate failed — and resets the chat state first,
+        so a failed song can never wedge the queue behind a phantom
+        'current' track that isn't actually playing."""
+        first_error = None
+        attempts = 1 + len(state.queue)
+        while state.current is not None and attempts > 0:
+            attempts -= 1
+            try:
+                await self._play_current(chat_id, state)
+                return
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                log.warning("could not start %r in %s; skipping it",
+                            state.current.title, chat_id, exc_info=True)
+                state.suppress_stream_end = True
+                state.advance(skipped=True)
+        if first_error is not None:
+            state.clear()
+            raise first_error
 
     async def insert_front_and_play(self, chat_id: int, track: Track):
         """Put a track at the front and jump to it (battle wins, polls)."""
@@ -90,7 +114,7 @@ class PlayerManager:
                 await self._skip_locked(chat_id, state)
             else:
                 state.start_track(state.queue.pop(0))
-                await self._play_current(chat_id, state)
+                await self._play_or_advance(chat_id, state)
 
     def _media_stream(self, state: ChatState, track: Track) -> MediaStream:
         path = track.file_path or track.stream_url
@@ -152,9 +176,63 @@ class PlayerManager:
             log.exception("play failed in chat %s", chat_id)
             raise
         self.store.record_action(chat_id, track, "play")
+        log.info("playing %r in %s via %s (%s)", track.title, chat_id,
+                 track.source, track.file_path or "remote URL")
+        asyncio.create_task(self._watchdog(chat_id, track))
         if not state.hidden_current:
             await self._send_card(chat_id, state)
         self._schedule_prefetch(chat_id, state)
+
+    async def _watchdog(self, chat_id: int, track: Track):
+        """A stream can be accepted by the call yet never actually play
+        (dead or stalled source) — the assistant then sits in the VC in
+        silence forever. If the playback position is still zero ~15 s
+        in, announce it and skip instead of sitting there."""
+        try:
+            await asyncio.sleep(12)
+            state = self.states.get(chat_id)
+            if state is None or state.current is not track or state.paused:
+                return
+            get_time = getattr(self.call, "time", None)
+            if get_time is None:
+                return
+            try:
+                t1 = await get_time(chat_id)
+            except Exception:
+                return
+            await asyncio.sleep(3)
+            state = self.states.get(chat_id)
+            if state is None or state.current is not track or state.paused:
+                return
+            try:
+                t2 = await get_time(chat_id)
+            except Exception:
+                return
+            if t1 is None or t2 is None or t1 != 0 or t2 != 0:
+                return  # position moved (or is unknowable) — it's playing
+            log.warning("watchdog: %r stuck at position 0 in %s; skipping",
+                        track.title, chat_id)
+            async with self.lock(chat_id):
+                state = self.state(chat_id)
+                if state.current is not track:
+                    return
+                try:
+                    await self.bot.send_message(
+                        chat_id,
+                        f"⚠️ **{track.title}** didn't actually play "
+                        "(dead stream) — skipping ⏭")
+                except Exception:
+                    pass
+                self.store.record_action(chat_id, track, "skip")
+                state.suppress_stream_end = True
+                nxt = state.advance(skipped=True)
+                if nxt is None:
+                    await self._delete_card(chat_id, state)
+                    await self._leave_locked(chat_id, state)
+                else:
+                    await self._play_current(chat_id, state)
+        except asyncio.CancelledError:
+            pass
 
     # ------------------------------------------------------------ transport
 
@@ -173,8 +251,12 @@ class PlayerManager:
         if nxt is None:
             await self._leave_locked(chat_id, state)
             return None
-        await self._play_current(chat_id, state)
-        return nxt
+        try:
+            await self._play_or_advance(chat_id, state)
+        except Exception:
+            await self._leave_locked(chat_id, state)
+            return None
+        return state.current
 
     async def pause(self, chat_id: int) -> bool:
         state = self.state(chat_id)
