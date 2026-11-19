@@ -445,13 +445,29 @@ def _prune_youtube_cache(cache: str, keep: int = 15) -> None:
         pass
 
 
+def _validate_file(path: str) -> bool:
+    """True when path is a real, playable audio file (>100 KB with a
+    probeable duration). Local copy — youtube.py must not depend on
+    another source module for something this small."""
+    import subprocess
+    if not os.path.exists(path) or os.path.getsize(path) < 100_000:
+        return False
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=15)
+        return float(out.stdout.strip() or 0) > 5
+    except Exception:
+        return False
+
+
 def _download_youtube_file(track: Track) -> None:
     """Download a YouTube track's audio through the WARP tunnel to the
     local cache and point track.file_path at it. Rotates client
     identities like extraction does. Raises YoutubeError if every
     client fails or produces an invalid file."""
     import glob
-    from deezer import _validate_file
     cache = os.path.join(config.DOWNLOAD_DIR, "youtube")
     os.makedirs(cache, exist_ok=True)
     for existing in glob.glob(os.path.join(cache, track.video_id + ".*")):
@@ -554,11 +570,14 @@ def resolve_stream(track: Track) -> Track:
                     return track
                 except Exception:
                     pass
+                yt_note = ("the YouTube route through the tunnel also "
+                           "failed just now" if config.YT_VIA_WARP else
+                           "YouTube is blocked from this server")
                 raise YoutubeError(
                     f"🔒 **{track.title}** — the original is DRM-locked "
-                    "on SoundCloud (only its own app may play it), and "
-                    "YouTube is blocked from this server. I can't play "
-                    "the original of this one right now.")
+                    f"on SoundCloud (only its own app may play it), and "
+                    f"{yt_note}. I can't play the original of this one "
+                    "right now.")
             raise YoutubeError(
                 "Could not get a playable stream from SoundCloud.")
         formats = [f for f in (info.get("formats") or []) if f.get("url")]
@@ -579,7 +598,7 @@ def resolve_stream(track: Track) -> Track:
         try:
             _download_youtube_file(track)
             return track
-        except YoutubeError as exc:
+        except Exception as exc:
             log.warning("WARP download failed for %r: %s — trying "
                         "direct extraction", track.title, exc)
     target = track.webpage_url or track.video_id
