@@ -168,24 +168,18 @@ def _raw_formats(url: str, clients, use_cookies: bool) -> str:
 
 
 def self_test() -> str:
-    """Startup probe: dump the raw format lists YouTube returns for the
-    owner's test video (web+cookies vs android_vr cookieless), then try
-    the full /play path on a fresh search result."""
-    url = "https://www.youtube.com/watch?v=rfTgO9rpqck"
-    lines = [
-        "web+cookies: " + _raw_formats(url, ["web"], True),
-        "android_vr plain: " + _raw_formats(url, ["android_vr"], False),
-    ]
+    """Startup probe: one Saavn search (cheap, no YouTube calls — this
+    host's IP is bot-walled there and extra extraction attempts only
+    tighten the flag)."""
     try:
-        track = search_tracks("Tum Hi Ho", limit=1)[0]
-        resolve_stream(track)
-        lines.append(f"playback path: OK — {track.title!r} "
-                     f"via {track.source}")
-    except YoutubeError as exc:
-        lines.append(f"playback path: FAIL — {str(exc)[:400]}")
-    except Exception as exc:  # search returned nothing, etc.
-        lines.append(f"playback path: ERROR — {exc!r}"[:400])
-    return "SELFTEST — " + " || ".join(lines)
+        import saavn
+        tracks = saavn.search_tracks("Tum Hi Ho", limit=1)
+        if tracks and tracks[0].stream_url:
+            return (f"SELFTEST OK — Saavn resolved {tracks[0].title!r} "
+                    f"with a direct stream URL")
+        return "SELFTEST FAIL — Saavn search returned no playable track"
+    except Exception as exc:
+        return f"SELFTEST FAIL — Saavn unreachable: {exc!r}"[:300]
 
 
 def track_from_info(info: dict, requester_id: int, requester_name: str,
@@ -211,6 +205,25 @@ def track_from_info(info: dict, requester_id: int, requester_name: str,
 
 def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
                   requester_name: str = "", dedication=None):
+    """Search -> list[Track] (best match first). JioSaavn first: its
+    catalog API works from server IPs (YouTube bot-walls this host even
+    with cookies + PO tokens) and is strongest for Indian music.
+    YouTube (flat search) is the fallback for anything Saavn lacks.
+    """
+    try:
+        import saavn
+        tracks = saavn.search_tracks(query, limit, requester_id,
+                                     requester_name, dedication)
+        if tracks:
+            return tracks
+    except Exception:
+        log.warning("Saavn search failed; trying YouTube", exc_info=True)
+    return _youtube_search_tracks(query, limit, requester_id,
+                                  requester_name, dedication)
+
+
+def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
+                           requester_name: str = "", dedication=None):
     """YouTube search -> list[Track] (best match first).
 
     extract_flat is ESSENTIAL: without it yt-dlp fully extracts the top
@@ -298,6 +311,12 @@ def _soundcloud_stream(title: str):
 
 def resolve_stream(track: Track) -> Track:
     """Fetch the direct audio URL for a track (mutates and returns it)."""
+    if track.source == "saavn":
+        # Saavn tracks carry their direct CDN URL from search time; the
+        # links are static, so just refresh the freshness stamp.
+        import time
+        track.stream_resolved_at = time.time()
+        return track
     target = track.webpage_url or track.video_id
     if not target:
         raise YoutubeError("Track has no YouTube reference to stream from.")
