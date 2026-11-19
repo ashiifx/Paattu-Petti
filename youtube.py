@@ -825,19 +825,26 @@ def _rank_originals(tracks, query: str):
     q = (query or "").lower()
     asked_tags = [tag for tag in _VERSION_TAGS_YT
                   if re.search(r"\b" + re.escape(tag) + r"\b", q)]
+    qwords = [w for w in re.findall(r"[a-z0-9]+", q)
+              if len(w) > 1 and w not in _STOP_WORDS]
 
     def key(item):
         idx, t = item
         title = (t.title or "").lower()
         bucket = int(math.log10((t.view_count or 0) + 1))
+        # Relevance before fame: a candidate missing query words
+        # ("Dark Knight Dummo" for "dark red") must not outrank the
+        # song actually asked for just because it's famous.
+        twords = set(re.findall(r"[a-z0-9]+", title))
+        missing = len([w for w in qwords if w not in twords])
         if asked_tags:
             # The query asks for a version (remix, slowed, ...):
             # titles carrying that tag go first.
             wanted = any(re.search(r"\b" + re.escape(tag) + r"\b", title)
                          for tag in asked_tags)
-            return (0 if wanted else 1, -bucket, idx)
+            return (0 if wanted else 1, missing, -bucket, idx)
         tagged = _has_version_tag(t.title)
-        return (1 if tagged else 0, -bucket, idx)
+        return (1 if tagged else 0, missing, -bucket, idx)
 
     return [t for _, t in sorted(enumerate(tracks), key=key)]
 
@@ -974,9 +981,37 @@ def resolve_stream(track: Track) -> Track:
                        if "m3u8" not in (f.get("protocol") or "")
                        and "m3u8" not in f.get("url", "")]
         chosen = progressive[-1] if progressive else formats[-1]
-        track.stream_url = chosen["url"]
-        track.stream_resolved_at = time.time()
-        return track
+        # SoundCloud stream URLs are minted for the extracting IP —
+        # under the tunnel that's the WARP egress, so the player
+        # fetching one directly gets silence (the watchdog's
+        # dead-stream skips). Download the file through the same
+        # route and stream it locally, exactly like YouTube tracks.
+        try:
+            cache = os.path.join(config.DOWNLOAD_DIR, "soundcloud")
+            os.makedirs(cache, exist_ok=True)
+            dest = os.path.join(
+                cache, f"{track.video_id or 'sc'}.{chosen.get('ext') or 'mp3'}")
+            if not (os.path.exists(dest) and _validate_file(dest)):
+                status, _, data = _http_get(
+                    chosen["url"], chosen.get("http_headers") or {},
+                    None, timeout=60)
+                if status != 200 or len(data) < 100_000:
+                    raise YoutubeError(f"SC download HTTP {status}")
+                with open(dest, "wb") as fh:
+                    fh.write(data)
+                if not _validate_file(dest):
+                    raise YoutubeError("SC download was not valid audio")
+            track.file_path = dest
+            track.stream_resolved_at = time.time()
+            _prune_youtube_cache(cache)
+            return track
+        except Exception as exc:
+            log.warning("SoundCloud download failed for %r (%s); "
+                        "using the direct stream URL", track.title,
+                        str(exc)[:100])
+            track.stream_url = chosen["url"]
+            track.stream_resolved_at = time.time()
+            return track
     if config.YT_VIA_WARP and track.video_id:
         # The stream URL would be bound to the WARP egress IP and the
         # player could not fetch it from here — download the file
