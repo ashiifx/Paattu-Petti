@@ -668,6 +668,13 @@ def _start_health_server():
     log.info("Health server listening on port %s", port)
 
 
+async def _self_test():
+    """Run the YouTube extraction probe off the event loop and print the
+    verdict where the deploy log can't miss it."""
+    loop = asyncio.get_running_loop()
+    print(await loop.run_in_executor(None, youtube.self_test), flush=True)
+
+
 async def main():
     missing = config.missing_vars()
     if missing:
@@ -703,6 +710,7 @@ async def main():
              me.first_name, me.username)
     print("🎶 Paattu Petti is live — /play something in your group!")
     _start_health_server()
+    asyncio.ensure_future(_self_test())
     await idle()
     await bot.stop()
     await assistant.stop()

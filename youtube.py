@@ -117,7 +117,7 @@ def _extract_resilient(query_or_url: str, opts: dict):
         client_sets = [["web"], ["web_safari"], ["mweb"]] + _CLIENT_SETS
     else:
         client_sets = _CLIENT_SETS
-    last_error = None
+    errors = []
     for clients in client_sets:
         attempt = dict(opts)
         if clients:
@@ -131,8 +131,28 @@ def _extract_resilient(query_or_url: str, opts: dict):
         except YoutubeError as exc:
             log.warning("extract failed via client=%s: %s",
                         clients or "default", str(exc)[:160])
-            last_error = exc
-    raise last_error or YoutubeError("Could not extract that song.")
+            # Keep a compact per-client record for the final error, so a
+            # failure report shows HOW each client was refused (the bare
+            # last error hides whether e.g. web+PO-token got further).
+            msg = str(exc)
+            if msg.startswith("[youtube]") and ": " in msg:
+                msg = msg.split(": ", 1)[1]
+            errors.append(f"{'+'.join(clients) if clients else 'default'}"
+                          f" → {msg[:110]}")
+    raise YoutubeError("Every client refused: " + " | ".join(errors))
+
+
+def self_test() -> str:
+    """One-shot extraction probe for startup: the deploy log gets a plain
+    verdict (and, on failure, the per-client breakdown) with no /play
+    needed. Uses the video the owner has been testing with."""
+    try:
+        info = _extract_resilient(
+            "https://www.youtube.com/watch?v=rfTgO9rpqck",
+            {"format": _AUDIO_FORMAT})
+        return f"SELFTEST OK — stream resolved for {info.get('title')!r}"
+    except YoutubeError as exc:
+        return f"SELFTEST FAIL — {exc}"
 
 
 def track_from_info(info: dict, requester_id: int, requester_name: str,
