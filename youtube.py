@@ -143,16 +143,34 @@ def _extract_resilient(query_or_url: str, opts: dict):
 
 
 def self_test() -> str:
-    """One-shot extraction probe for startup: the deploy log gets a plain
-    verdict (and, on failure, the per-client breakdown) with no /play
-    needed. Uses the video the owner has been testing with."""
+    """Startup probe, two parts: (1) dump what formats YouTube actually
+    returns for the owner's test video, (2) try the full /play path on a
+    fresh search result. The verdict prints to the deploy log."""
+    url = "https://www.youtube.com/watch?v=rfTgO9rpqck"
+    lines = []
     try:
-        info = _extract_resilient(
-            "https://www.youtube.com/watch?v=rfTgO9rpqck",
-            {"format": _AUDIO_FORMAT})
-        return f"SELFTEST OK — stream resolved for {info.get('title')!r}"
+        info = _extract(url, {"extractor_args": {
+            "youtube": {"player_client": ["web"]}}}, use_cookies=True)
+        fmts = info.get("formats") or []
+        desc = ", ".join(
+            f"{f.get('format_id')}/{f.get('ext')}"
+            f"/a:{(f.get('acodec') or 'none')[:4]}"
+            f"/v:{(f.get('vcodec') or 'none')[:4]}"
+            f"/url:{'y' if f.get('url') else 'n'}"
+            for f in fmts[:18])
+        lines.append(f"formats via web: {len(fmts)} — {desc or 'NONE'}")
     except YoutubeError as exc:
-        return f"SELFTEST FAIL — {exc}"
+        lines.append(f"formats via web: EXTRACT FAIL {str(exc)[:120]}")
+    try:
+        track = search_tracks("Tum Hi Ho", limit=1)[0]
+        resolve_stream(track)
+        lines.append(f"playback path: OK — {track.title!r} "
+                     f"via {track.source}")
+    except YoutubeError as exc:
+        lines.append(f"playback path: FAIL — {str(exc)[:400]}")
+    except Exception as exc:  # search returned nothing, etc.
+        lines.append(f"playback path: ERROR — {exc!r}"[:400])
+    return "SELFTEST — " + " || ".join(lines)
 
 
 def track_from_info(info: dict, requester_id: int, requester_name: str,
