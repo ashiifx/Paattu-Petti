@@ -249,8 +249,10 @@ def _saavn_confident(query: str, track) -> bool:
     often a cover or a nightcore/sped-up upload by someone else.
     Rules: a junk-version tag in the title that the query didn't ask
     for disqualifies; at least half the query's words must appear in
-    the title; and any remaining query words (usually the artist's
-    name) must show up in the artist field."""
+    the title or the artist field (a 2-word title + artist name, e.g.
+    "believer imagine dragons", must not fail the title-only half
+    rule when the artist matches); and any remaining query words
+    (usually the artist's name) must show up in the artist field."""
     q = query.lower()
     title = track.title.lower()
     if any(tag in title for tag in _JUNK_TAGS if tag not in q):
@@ -264,7 +266,9 @@ def _saavn_confident(query: str, track) -> bool:
                                   (track.uploader or "").lower()))
     in_title = [w for w in words if w in title_words]
     rest = [w for w in words if w not in title_words]
-    if len(in_title) / len(words) < 0.5:
+    covered = [w for w in words
+               if w in title_words or w in artist_words]
+    if len(covered) / len(words) < 0.5:
         return False
     if rest and not any(w in artist_words for w in rest):
         return False
@@ -810,6 +814,35 @@ def _warp_probe() -> str:
         return f"WARP FAIL — {str(exc)[:170]}"
 
 
+def _youtube_fallback_for(track: Track, longer_than: int = 0) -> Track:
+    """Resolve a SoundCloud track's song via YouTube — used when
+    SoundCloud DRM-locks it or serves only a short preview. Searches
+    YouTube, picks the candidate closest to the original, resolves
+    it, and copies the playable result onto `track` in place. With
+    longer_than > 0, raises YoutubeError unless YouTube's best
+    candidate runs at least 60s longer — the caller then keeps its
+    SoundCloud stream. Raises YoutubeError on any failure."""
+    yt = _youtube_search_tracks(
+        f"{track.title} {track.uploader}".strip(), 5,
+        track.requester_id, track.requester_name, track.dedication)
+    pick = _closest_to_original(yt, track)
+    if longer_than and (pick.duration or 0) <= longer_than + 60:
+        raise YoutubeError("YouTube has no substantially longer version")
+    resolved = resolve_stream(pick)
+    track.stream_url = resolved.stream_url
+    # The tunnel path DOWNLOADS instead of returning a URL — without
+    # copying file_path the player gets neither and streams the
+    # SoundCloud page itself (silence, then the watchdog skip).
+    track.file_path = resolved.file_path
+    track.webpage_url = resolved.webpage_url
+    track.video_id = resolved.video_id
+    if resolved.duration:
+        track.duration = resolved.duration
+    track.stream_resolved_at = resolved.stream_resolved_at
+    track.source = "youtube"
+    return track
+
+
 def resolve_stream(track: Track) -> Track:
     """Fetch the direct audio URL for a track (mutates and returns it)."""
     if track.source == "deezer":
@@ -835,29 +868,9 @@ def resolve_stream(track: Track) -> Track:
         except YoutubeError as exc:
             if "DRM" in str(exc):
                 # Last resort before giving up: the same song on
-                # YouTube. From this host YouTube is IP-walled so it
-                # fails fast — but from a trusted IP (home connection,
-                # cleaner host) this is exactly how these songs play.
+                # YouTube.
                 try:
-                    yt = _youtube_search_tracks(
-                        f"{track.title} {track.uploader}".strip(), 5,
-                        track.requester_id, track.requester_name,
-                        track.dedication)
-                    resolved = resolve_stream(
-                        _closest_to_original(yt, track))
-                    track.stream_url = resolved.stream_url
-                    # The tunnel path DOWNLOADS instead of returning a
-                    # URL — without copying file_path the player got
-                    # neither and streamed the SoundCloud page itself
-                    # (silence, then the watchdog's dead-stream skip).
-                    track.file_path = resolved.file_path
-                    track.webpage_url = resolved.webpage_url
-                    track.video_id = resolved.video_id
-                    if resolved.duration:
-                        track.duration = resolved.duration
-                    track.stream_resolved_at = resolved.stream_resolved_at
-                    track.source = "youtube"
-                    return track
+                    return _youtube_fallback_for(track)
                 except Exception:
                     pass
                 yt_note = ("the YouTube route through the tunnel also "
@@ -874,6 +887,17 @@ def resolve_stream(track: Track) -> Track:
         if not formats:
             raise YoutubeError(
                 "Could not get a playable stream from SoundCloud.")
+        sc_duration = int(info.get("duration") or 0)
+        if 0 < sc_duration <= 95:
+            # SoundCloud serves major-label tracks as short previews
+            # (30s/90s) through the API — playable, but only a snippet
+            # of the song. If YouTube's version is substantially
+            # longer, this is a preview: play YouTube's instead.
+            try:
+                return _youtube_fallback_for(track,
+                                             longer_than=sc_duration)
+            except Exception:
+                pass
         progressive = [f for f in formats
                        if "m3u8" not in (f.get("protocol") or "")
                        and "m3u8" not in f.get("url", "")]
