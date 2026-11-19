@@ -28,6 +28,22 @@ POPULAR_SEEDS = [
 GUESS_ROUND_SECONDS = 60
 VOTE_SECONDS = 30
 
+_COMPILATION_TELLS = ("full album", "greatest hits", "best songs",
+                      "best of", "jukebox", "nonstop", "non-stop",
+                      "medley", "collection", "playlist", "all songs",
+                      "album songs", "hits of")
+
+
+def _guessable(track) -> bool:
+    """A Guess round needs ONE normal song: no compilations or
+    albums (the seed queries like 'Bruno Mars hits' attract 4-hour
+    'Greatest Hits Full Album' videos), no marathon tracks, and no
+    short previews. 1-10 minutes, no compilation tells in the title."""
+    title = (track.title or "").lower()
+    if any(tell in title for tell in _COMPILATION_TELLS):
+        return False
+    return 60 <= (track.duration or 0) <= 600
+
 
 async def _search(query, limit=1):
     loop = asyncio.get_running_loop()
@@ -50,14 +66,19 @@ class GuessManager:
         state = self.player.state(chat_id)
         if state.current is not None:
             return "busy"
-        seed = random.choice(POPULAR_SEEDS)
-        try:
-            results = await _search(seed, limit=3)
-        except youtube.YoutubeError:
+        track = None
+        for _ in range(3):
+            seed = random.choice(POPULAR_SEEDS)
+            try:
+                results = await _search(seed, limit=5)
+            except youtube.YoutubeError:
+                continue
+            pool = [t for t in results if _guessable(t)]
+            if pool:
+                track = random.choice(pool)
+                break
+        if track is None:
             return "error"
-        if not results:
-            return "error"
-        track = random.choice(results)
         track.requester_name = "🎲 Guess the Song"
         self.rounds[chat_id] = {"track": track}
         await self.player.enqueue(chat_id, track, hidden=True)
@@ -67,26 +88,46 @@ class GuessManager:
             self._hint(chat_id))
         return "started"
 
+    def _discard(self, chat_id: int):
+        """End a round silently, cancelling its timers — used when
+        the song was skipped/stopped or the VC was left mid-round,
+        so the hint and 'Time up' don't post into a dead game."""
+        round_ = self.rounds.pop(chat_id, None)
+        if round_:
+            for key in ("timeout_task", "hint_task"):
+                task = round_.get(key)
+                if task and task is not asyncio.current_task():
+                    task.cancel()
+
     async def _hint(self, chat_id: int):
         try:
             await asyncio.sleep(GUESS_ROUND_SECONDS // 2)
             round_ = self.rounds.get(chat_id)
-            if round_:
-                artist = round_["track"].uploader or "?"
-                await self.bot.send_message(
-                    chat_id, f"💡 Hint: the artist is **{artist}**")
+            if not round_:
+                return
+            if self.player.state(chat_id).current is not round_["track"]:
+                self._discard(chat_id)
+                return
+            artist = round_["track"].uploader or "?"
+            await self.bot.send_message(
+                chat_id, f"💡 Hint: the artist is **{artist}**")
         except asyncio.CancelledError:
             pass
 
     async def _timeout(self, chat_id: int):
         try:
             await asyncio.sleep(GUESS_ROUND_SECONDS)
-            round_ = self.rounds.pop(chat_id, None)
-            if round_:
-                await self.bot.send_message(
-                    chat_id,
-                    f"⏰ Time up! The song was **{round_['track'].title}**. "
-                    "Aarkum kittiyilla this time 😅")
+            round_ = self.rounds.get(chat_id)
+            if not round_:
+                return
+            if self.player.state(chat_id).current is not round_["track"]:
+                self._discard(chat_id)
+                return
+            self.rounds.pop(chat_id, None)
+            await self.bot.send_message(
+                chat_id,
+                f"⏰ Time up! The song was **{round_['track'].title}**. "
+                "Aarkum kittiyilla this time 😅")
         except asyncio.CancelledError:
             pass
 
