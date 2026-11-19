@@ -11,6 +11,8 @@ yt-dlp==2026.10.26
 bgutil-ytdlp-pot-provider==2.0.2
 # Blowfish for the Deezer source's stripe decryption.
 pycryptodome==3.23.0
+# SOCKS5 client for the parallel WARP-tunnel downloader in youtube.py.
+PySocks==1.7.1
 
 # Optional: TgCrypto speeds up Pyrogram's crypto a lot. Needs a C compiler
 # to build on some systems; the bot works fine without it.

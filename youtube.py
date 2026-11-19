@@ -11,6 +11,8 @@ import re
 
 import yt_dlp
 
+import time
+
 import config
 from queuestate import Track
 
@@ -462,6 +464,172 @@ def _validate_file(path: str) -> bool:
         return False
 
 
+_DL_FORMAT = ("bestaudio[ext=m4a][abr<=192]/bestaudio[abr<=192]/"
+              "bestaudio[ext=m4a]/bestaudio/best")
+
+
+def _http_get(url: str, headers: dict, byte_range: str | None = None,
+              timeout: int = 30):
+    """One HTTP/1.1 GET over a (optionally WARP-proxied) TLS socket.
+
+    Returns (status, headers, body). googlevideo serves media with a
+    Content-Length and no chunking, which keeps this simple. Follows
+    up to 3 redirects."""
+    import socket
+    import ssl
+    import urllib.parse
+    for _ in range(4):
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        use_tls = parsed.scheme != "http"
+        port = parsed.port or (443 if use_tls else 80)
+        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        if config.YT_VIA_WARP:
+            import socks
+            proxy = urllib.parse.urlparse(config.WARP_PROXY)
+            raw = socks.create_connection(
+                (host, port), proxy_type=socks.SOCKS5,
+                proxy_addr=proxy.hostname, proxy_port=proxy.port or 1080,
+                proxy_rdns=True, timeout=timeout)
+        else:
+            raw = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if use_tls:
+                sock = ssl.create_default_context().wrap_socket(
+                    raw, server_hostname=host)
+            else:
+                sock = raw
+            req = {"Host": host, "Connection": "close"}
+            req.update(headers or {})
+            if byte_range:
+                req["Range"] = byte_range
+            lines = [f"GET {path} HTTP/1.1"] + \
+                [f"{k}: {v}" for k, v in req.items()]
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    raise YoutubeError("connection closed during headers")
+                buf += chunk
+            head, _, body = buf.partition(b"\r\n\r\n")
+            hlines = head.decode("iso-8859-1").split("\r\n")
+            status = int(hlines[0].split()[1])
+            resp = {}
+            for line in hlines[1:]:
+                if ": " in line:
+                    k, v = line.split(": ", 1)
+                    resp[k.lower()] = v
+            if status in (301, 302, 303, 307, 308) and resp.get("location"):
+                url = resp["location"]
+                continue
+            length = int(resp.get("content-length") or 0)
+            if length:
+                while len(body) < length:
+                    chunk = sock.recv(262144)
+                    if not chunk:
+                        break
+                    body += chunk
+                body = body[:length]
+            else:
+                while True:
+                    chunk = sock.recv(262144)
+                    if not chunk:
+                        break
+                    body += chunk
+            return status, resp, body
+        finally:
+            try:
+                raw.close()
+            except Exception:
+                pass
+    raise YoutubeError("too many redirects")
+
+
+def _pick_download_format(info: dict):
+    """Best download format: audio-only, prefer <=192 kbps (the voice
+    chat re-encodes anyway — bigger files only slow the download),
+    m4a over webm."""
+    formats = [f for f in (info.get("formats") or [])
+               if f.get("url") and f.get("acodec") not in (None, "none")]
+    if not formats:
+        if info.get("url"):
+            return {"url": info["url"],
+                    "http_headers": info.get("http_headers") or {},
+                    "ext": info.get("ext") or "m4a"}
+        return None
+
+    def key(f):
+        abr = f.get("abr") or 0
+        over = 1 if abr > 192 else 0
+        has_video = 0 if f.get("vcodec") in (None, "none") else 1
+        return (has_video, over, -abr if not over else abr,
+                0 if f.get("ext") == "m4a" else 1)
+
+    return sorted(formats, key=key)[0]
+
+
+def _parallel_download(fmt: dict, dest: str) -> bool:
+    """Download fmt's URL to dest in parallel byte ranges through the
+    tunnel. Falls back to a single full download when the server
+    doesn't honour ranges. True on success."""
+    import concurrent.futures
+    url = fmt["url"]
+    headers = fmt.get("http_headers") or {}
+    status, resp, _ = _http_get(url, headers, "bytes=0-0")
+    total = None
+    if status == 206:
+        crange = resp.get("content-range", "")
+        if "/" in crange:
+            try:
+                total = int(crange.rsplit("/", 1)[1])
+            except ValueError:
+                total = None
+    if not total:
+        status, resp, data = _http_get(url, headers, None, timeout=60)
+        if status != 200 or len(data) < 100_000:
+            return False
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        return True
+    nparts = 6 if total > 3_000_000 else 3
+    step = (total + nparts - 1) // nparts
+    bounds = [(s, min(s + step, total) - 1)
+              for s in range(0, total, step)]
+
+    def fetch(index: int, start: int, end: int) -> str:
+        part = f"{dest}.part{index}"
+        for _ in range(2):
+            st, _, data = _http_get(url, headers,
+                                    f"bytes={start}-{end}", timeout=60)
+            if st == 206 and len(data) == end - start + 1:
+                with open(part, "wb") as fh:
+                    fh.write(data)
+                return part
+        raise YoutubeError(f"range {start}-{end} failed")
+
+    parts = []
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(bounds)) as pool:
+            futures = [pool.submit(fetch, i, s, e)
+                       for i, (s, e) in enumerate(bounds)]
+            parts = [f.result() for f in futures]
+        with open(dest, "wb") as out:
+            for part in parts:
+                with open(part, "rb") as fh:
+                    out.write(fh.read())
+        return os.path.getsize(dest) == total
+    except Exception:
+        return False
+    finally:
+        for part in parts:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+
+
 def _download_youtube_file(track: Track) -> None:
     """Download a YouTube track's audio through the WARP tunnel to the
     local cache and point track.file_path at it. Rotates client
@@ -477,6 +645,25 @@ def _download_youtube_file(track: Track) -> None:
             return
     url = track.webpage_url or \
         f"https://www.youtube.com/watch?v={track.video_id}"
+    # Fast path: one extraction + a parallel ranged download through
+    # the tunnel — several times quicker than yt-dlp's single stream.
+    try:
+        info = _extract_resilient(url, {"format": _DL_FORMAT})
+        fmt = _pick_download_format(info)
+        if fmt:
+            dest = os.path.join(
+                cache, f"{track.video_id}.{fmt.get('ext') or 'm4a'}")
+            if _parallel_download(fmt, dest) and _validate_file(dest):
+                track.file_path = dest
+                track.stream_resolved_at = time.time()
+                if info.get("duration"):
+                    track.duration = int(info["duration"])
+                log.info("youtube fast download ok: %s", track.title)
+                _prune_youtube_cache(cache)
+                return
+    except Exception as exc:
+        log.info("fast download failed for %r (%s); yt-dlp fallback",
+                 track.title, str(exc)[:120])
     errors = []
     if _cookiefile():
         client_sets = [["web"], ["web_safari"], ["mweb"]] + _CLIENT_SETS
@@ -485,7 +672,7 @@ def _download_youtube_file(track: Track) -> None:
     for clients in client_sets:
         label = "+".join(clients) if clients else "default"
         opts = {**_BASE_OPTS,
-                "format": _AUDIO_FORMAT,
+                "format": _DL_FORMAT,
                 "outtmpl": os.path.join(cache, track.video_id + ".%(ext)s"),
                 "noplaylist": True,
                 "overwrites": True}
@@ -511,6 +698,28 @@ def _download_youtube_file(track: Track) -> None:
                 return
         errors.append(f"{label}: no valid file produced")
     raise YoutubeError("Tunnel download failed — " + " | ".join(errors[:3]))
+
+
+_VERSION_TAGS_YT = ("remix", "cover", "sped up", "slowed", "reverb",
+                    "8d", "nightcore", "lofi", "instrumental", "karaoke")
+
+
+def _closest_to_original(candidates, reference):
+    """Pick the candidate most likely to be the same recording as the
+    reference track: no version tags (unless the reference has them),
+    then closest duration. Stops the SoundCloud-DRM fallback from
+    grabbing a 2:20 remix of a 3:53 original."""
+    ref_title = (reference.title or "").lower()
+
+    def key(t):
+        title = (t.title or "").lower()
+        tagged = any(tag in title for tag in _VERSION_TAGS_YT) and \
+            not any(tag in ref_title for tag in _VERSION_TAGS_YT)
+        gap = abs((t.duration or 0) - (reference.duration or 0)) \
+            if reference.duration else 0
+        return (1 if tagged else 0, gap)
+
+    return sorted(candidates, key=key)[0]
 
 
 def _warp_probe() -> str:
@@ -560,10 +769,11 @@ def resolve_stream(track: Track) -> Track:
                 # cleaner host) this is exactly how these songs play.
                 try:
                     yt = _youtube_search_tracks(
-                        f"{track.title} {track.uploader}".strip(), 1,
+                        f"{track.title} {track.uploader}".strip(), 5,
                         track.requester_id, track.requester_name,
                         track.dedication)
-                    resolved = resolve_stream(yt[0])
+                    resolved = resolve_stream(
+                        _closest_to_original(yt, track))
                     track.stream_url = resolved.stream_url
                     # The tunnel path DOWNLOADS instead of returning a
                     # URL — without copying file_path the player got
@@ -572,6 +782,8 @@ def resolve_stream(track: Track) -> Track:
                     track.file_path = resolved.file_path
                     track.webpage_url = resolved.webpage_url
                     track.video_id = resolved.video_id
+                    if resolved.duration:
+                        track.duration = resolved.duration
                     track.stream_resolved_at = resolved.stream_resolved_at
                     track.source = "youtube"
                     return track
