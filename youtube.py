@@ -268,7 +268,24 @@ def _saavn_confident(query: str, track) -> bool:
         return False
     if rest and not any(w in artist_words for w in rest):
         return False
+    if not rest and (track.view_count or 0) < 500_000:
+        # Title-only match — no artist words to cross-check against.
+        # A famous song's original has hundreds of thousands of plays
+        # on Saavn; a low-play exact-title hit is a cover riding the
+        # name (e.g. "Believer" by an unknown singer at 31k plays,
+        # while the Imagine Dragons original doesn't appear in
+        # Saavn's results at all). Don't trust it on its own.
+        return False
     return True
+
+
+def _clearly_famous(candidate, reference) -> bool:
+    """True when the candidate out-views the reference by 50x or more
+    — the signature of 'the real original vs a cover riding its name'.
+    Guards the fall-through sources so they can only override a held
+    Saavn hit when they are unmistakably the bigger recording."""
+    return (candidate.view_count or 0) >= \
+        50 * max(reference.view_count or 0, 1)
 
 
 def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
@@ -305,14 +322,20 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
         sc_tracks = _soundcloud_search_tracks(query, limit, requester_id,
                                               requester_name, dedication)
         if sc_tracks:
-            return sc_tracks
+            if not saavn_tracks or _clearly_famous(sc_tracks[0],
+                                                    saavn_tracks[0]):
+                return sc_tracks
+            return saavn_tracks
     except YoutubeError:
         pass
     try:
         yt_tracks = _youtube_search_tracks(query, limit, requester_id,
                                            requester_name, dedication)
         if yt_tracks:
-            return yt_tracks
+            if not saavn_tracks or _clearly_famous(yt_tracks[0],
+                                                    saavn_tracks[0]):
+                return yt_tracks
+            return saavn_tracks
     except YoutubeError:
         pass
     # Last resort: Saavn's weak hit (often a cover for English queries)

@@ -110,6 +110,7 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
             source="saavn",
             stream_url=stream,
             stream_resolved_at=time.time(),
+            view_count=int(r.get("playCount") or 0),
         ))
     return tracks[:max(1, limit)]
 
