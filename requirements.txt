@@ -5,6 +5,10 @@ kurigram==2.2.27
 py-tgcalls==3.0.1
 ntgcalls==3.0.7
 yt-dlp==2026.10.26
+# PO-token provider plugin — pairs with the bgutil server built in the
+# Dockerfile (same version, 2.0.2) so YouTube accepts extraction from
+# datacenter IPs. Without it, cookies alone still hit the bot wall.
+bgutil-ytdlp-pot-provider==2.0.2
 
 # Optional: TgCrypto speeds up Pyrogram's crypto a lot. Needs a C compiler
 # to build on some systems; the bot works fine without it.

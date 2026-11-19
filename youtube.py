@@ -25,6 +25,10 @@ _BASE_OPTS = {
     "noplaylist": True,
     "socket_timeout": 15,
     "retries": 2,
+    # Node is installed in the Docker image (for the PO-token server);
+    # yt-dlp needs a JS runtime enabled to solve YouTube's player
+    # challenges for the web clients. Harmless where node is absent.
+    "js_runtimes": {"node": {}},
 }
 
 _AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
