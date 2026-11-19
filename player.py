@@ -161,6 +161,8 @@ class PlayerManager:
         if track.source in ("youtube", "soundcloud") \
                 and not track.stream_fresh():
             await self._run(youtube.resolve_stream, track)
+        elif track.source == "deezer" and not track.file_path:
+            await self._run(youtube.resolve_stream, track)
         elif track.source == "saavn" and not track.file_path:
             # Best-effort: a local file streams far more smoothly than a
             # remote URL on the free tier. Falls back to the URL.
@@ -407,7 +409,10 @@ class PlayerManager:
         if not state.queue:
             return
         nxt = state.queue[0]
-        if nxt.source not in ("youtube", "soundcloud") or nxt.stream_fresh():
+        if nxt.source not in ("youtube", "soundcloud", "deezer") \
+                or nxt.stream_fresh():
+            return
+        if nxt.source == "deezer" and nxt.file_path:
             return
 
         async def _prefetch():

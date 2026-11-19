@@ -122,6 +122,11 @@ _YT_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+DEEZER_URL_RE = re.compile(
+    r"(https?://)?(www\.)?deezer\.com/(\w{2}/)?track/\d+\S*",
+    re.IGNORECASE,
+)
+
 
 def find_youtube_url(text: str):
     """Return the first YouTube URL in the text, or None."""
@@ -132,6 +137,14 @@ def find_youtube_url(text: str):
     if not url.startswith("http"):
         url = "https://" + url
     return url
+
+
+def find_deezer_url(text: str):
+    """Return the Deezer track URL in text, if any."""
+    if not text:
+        return None
+    match = DEEZER_URL_RE.search(text)
+    return match.group(0) if match else None
 
 
 def is_playlist_url(url: str) -> bool:

@@ -9,6 +9,8 @@ yt-dlp==2026.10.26
 # Dockerfile (same version, 2.0.2) so YouTube accepts extraction from
 # datacenter IPs. Without it, cookies alone still hit the bot wall.
 bgutil-ytdlp-pot-provider==2.0.2
+# Blowfish for the Deezer source's stripe decryption.
+pycryptodome==3.23.0
 
 # Optional: TgCrypto speeds up Pyrogram's crypto a lot. Needs a C compiler
 # to build on some systems; the bot works fine without it.

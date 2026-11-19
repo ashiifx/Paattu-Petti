@@ -565,6 +565,13 @@ def resolve_stream(track: Track) -> Track:
                         track.dedication)
                     resolved = resolve_stream(yt[0])
                     track.stream_url = resolved.stream_url
+                    # The tunnel path DOWNLOADS instead of returning a
+                    # URL — without copying file_path the player got
+                    # neither and streamed the SoundCloud page itself
+                    # (silence, then the watchdog's dead-stream skip).
+                    track.file_path = resolved.file_path
+                    track.webpage_url = resolved.webpage_url
+                    track.video_id = resolved.video_id
                     track.stream_resolved_at = resolved.stream_resolved_at
                     track.source = "youtube"
                     return track

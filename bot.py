@@ -29,8 +29,9 @@ import youtube
 from games import BattleManager, GuessManager, PollManager
 from player import EFFECTS, PlayerManager
 from storage import Storage
-from utils import (find_youtube_url, format_duration, is_playlist_url,
-                   parse_dedication, truncate, votes_needed)
+from utils import (find_deezer_url, find_youtube_url, format_duration,
+                   is_playlist_url, parse_dedication, truncate,
+                   votes_needed)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +50,7 @@ HELP_TEXT = """🎶 **Paattu Petti — commands**
 
 **Playing**
 /play <song name> — search & play in the voice chat
-/play <YouTube link> — play a video / queue a playlist (up to 20)
+/play <YouTube or Deezer link> — play it / queue a playlist (up to 20)
 /play <song> for @user — dedicate a song
 /play (reply to an audio file) — play that file
 /queue — what's lined up • /remove <n> • /shuffle
@@ -176,6 +177,7 @@ def register_bot_handlers(bot, player, guess, battle, poll, store):
             return
         query, dedication = parse_dedication(raw)
         url = find_youtube_url(query)
+        dz_url = find_deezer_url(query)
         status_msg = await message.reply("🔎 Searching…")
         try:
             if url and is_playlist_url(url):
@@ -196,7 +198,14 @@ def register_bot_handlers(bot, player, guess, battle, poll, store):
                     + (" First one is playing 🎶" if first_status == "playing"
                        else ""))
                 return
-            if url:
+            if dz_url:
+                import deezer
+                try:
+                    track = await _run(deezer.track_from_url, dz_url,
+                                       user.id, name, dedication)
+                except deezer.DeezerError as exc:
+                    raise youtube.YoutubeError(str(exc)) from exc
+            elif url:
                 track = await _run(youtube.track_from_url, url, user.id,
                                    name, dedication)
             else:
@@ -687,6 +696,13 @@ def _start_health_server():
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"Paattu Petti is live")
+
+        def do_HEAD(self):
+            # Uptime monitors (Better Stack etc.) probe with HEAD; the
+            # default handler answers 501, which they report as DOWN
+            # even though the service is perfectly alive.
+            self.send_response(200)
+            self.end_headers()
 
         def log_message(self, *args):
             pass
