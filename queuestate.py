@@ -28,6 +28,7 @@ class Track:
     thumbnail: str = ""
     dedication: Optional[str] = None        # "@user" the song is dedicated to
     source: str = "youtube"                 # "youtube" | "file"
+    view_count: int = 0                     # search ranking signal
     file_path: Optional[str] = None         # for source == "file"
     stream_url: Optional[str] = None        # pre-fetched direct audio URL
     stream_resolved_at: float = 0.0

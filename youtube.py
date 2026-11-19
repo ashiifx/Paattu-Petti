@@ -231,6 +231,7 @@ def track_from_info(info: dict, requester_id: int, requester_name: str,
         requester_name=requester_name,
         dedication=dedication,
         source="youtube",
+        view_count=int(info.get("view_count") or 0),
     )
 
 
@@ -325,8 +326,15 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
 def _soundcloud_search_tracks(query: str, limit: int, requester_id: int,
                               requester_name: str, dedication=None):
     """SoundCloud search (flat) -> list[Track]; streams resolve lazily
-    in resolve_stream via _soundcloud_page_stream."""
-    info = _extract(f"scsearch{limit}:{query}",
+    in resolve_stream via _soundcloud_page_stream.
+
+    Fetches several candidates and ranks them original-first:
+    SoundCloud's raw #1 for a famous song is often a cover (the
+    original is DRM-locked, covers stream freely), so taking the top
+    hit blindly kept serving random singers. If even the best-ranked
+    candidate is a tagged version, SoundCloud is rejected entirely
+    and the caller falls through to YouTube."""
+    info = _extract(f"scsearch{max(limit, 8)}:{query}",
                     {"noplaylist": True, "extract_flat": True})
     tracks = []
     for e in (info.get("entries") or []):
@@ -340,7 +348,11 @@ def _soundcloud_search_tracks(query: str, limit: int, requester_id: int,
         track = track_from_info(e, requester_id, requester_name, dedication)
         track.source = "soundcloud"
         tracks.append(track)
-    return tracks
+    tracks = _rank_originals(tracks, query)
+    if tracks and _has_version_tag(tracks[0].title) and \
+            not _has_version_tag(query):
+        return []
+    return tracks[:limit]
 
 
 def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
@@ -354,7 +366,7 @@ def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
     from the search API; the real extraction happens later, in
     resolve_stream.
     """
-    info = _extract(f"ytsearch{limit}:{query}",
+    info = _extract(f"ytsearch{max(limit, 5)}:{query}",
                     {"noplaylist": True, "extract_flat": True})
     entries = info.get("entries") or []
     tracks = []
@@ -368,7 +380,7 @@ def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
                 e["thumbnail"] = thumbs[-1].get("url", "")
         tracks.append(track_from_info(e, requester_id, requester_name,
                                       dedication))
-    return tracks
+    return _rank_originals(tracks, query)[:limit]
 
 
 def track_from_url(url: str, requester_id: int, requester_name: str,
@@ -700,8 +712,44 @@ def _download_youtube_file(track: Track) -> None:
     raise YoutubeError("Tunnel download failed — " + " | ".join(errors[:3]))
 
 
-_VERSION_TAGS_YT = ("remix", "cover", "sped up", "slowed", "reverb",
-                    "8d", "nightcore", "lofi", "instrumental", "karaoke")
+_VERSION_TAGS_YT = ("remix", "cover", "sped up", "sped-up", "slowed",
+                    "reverb", "8d", "nightcore", "lofi", "lo-fi",
+                    "instrumental", "karaoke", "tribute", "mashup",
+                    "live")
+
+
+def _has_version_tag(title: str) -> bool:
+    """True when a title carries a version tag (cover/remix/...).
+    Word-boundary matched so 'Discover' doesn't trip on 'cover'."""
+    text = (title or "").lower()
+    return any(re.search(r"\b" + re.escape(tag) + r"\b", text)
+               for tag in _VERSION_TAGS_YT)
+
+
+def _rank_originals(tracks, query: str):
+    """Reorder search results so the real original wins over covers:
+    version-tagged titles sink (unless the query asks for one), then
+    bigger view counts win — originals out-view covers by orders of
+    magnitude — and the source's own relevance order breaks ties."""
+    import math
+    q = (query or "").lower()
+    asked_tags = [tag for tag in _VERSION_TAGS_YT
+                  if re.search(r"\b" + re.escape(tag) + r"\b", q)]
+
+    def key(item):
+        idx, t = item
+        title = (t.title or "").lower()
+        bucket = int(math.log10((t.view_count or 0) + 1))
+        if asked_tags:
+            # The query asks for a version (remix, slowed, ...):
+            # titles carrying that tag go first.
+            wanted = any(re.search(r"\b" + re.escape(tag) + r"\b", title)
+                         for tag in asked_tags)
+            return (0 if wanted else 1, -bucket, idx)
+        tagged = _has_version_tag(t.title)
+        return (1 if tagged else 0, -bucket, idx)
+
+    return [t for _, t in sorted(enumerate(tracks), key=key)]
 
 
 def _closest_to_original(candidates, reference):
