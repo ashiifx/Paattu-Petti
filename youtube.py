@@ -50,11 +50,12 @@ def _cookiefile():
     return _COOKIE_PATH
 
 
-def _extract(query_or_url: str, opts: dict):
+def _extract(query_or_url: str, opts: dict, use_cookies: bool = False):
     merged = {**_BASE_OPTS, **opts}
-    cookiefile = _cookiefile()
-    if cookiefile:
-        merged.setdefault("cookiefile", cookiefile)
+    if use_cookies:
+        cookiefile = _cookiefile()
+        if cookiefile:
+            merged.setdefault("cookiefile", cookiefile)
     try:
         with yt_dlp.YoutubeDL(merged) as ydl:
             return ydl.extract_info(query_or_url, download=False)
@@ -89,7 +90,7 @@ def _extract_resilient(query_or_url: str, opts: dict):
                 "youtube": {"player_client": clients}
             }
         try:
-            info = _extract(query_or_url, attempt)
+            info = _extract(query_or_url, attempt, use_cookies=True)
             log.info("extract ok via client=%s", clients or "default")
             return info
         except YoutubeError as exc:
