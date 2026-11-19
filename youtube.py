@@ -142,25 +142,40 @@ def _extract_resilient(query_or_url: str, opts: dict):
     raise YoutubeError("Every client refused: " + " | ".join(errors))
 
 
-def self_test() -> str:
-    """Startup probe, two parts: (1) dump what formats YouTube actually
-    returns for the owner's test video, (2) try the full /play path on a
-    fresh search result. The verdict prints to the deploy log."""
-    url = "https://www.youtube.com/watch?v=rfTgO9rpqck"
-    lines = []
+def _raw_formats(url: str, clients, use_cookies: bool) -> str:
+    """Diagnostic: extract with process=False so we see the format list
+    YouTube actually returned, even when format selection would fail."""
+    opts = {**_BASE_OPTS,
+            "extractor_args": {"youtube": {"player_client": clients}}}
+    if use_cookies:
+        cookiefile = _cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
     try:
-        info = _extract(url, {"extractor_args": {
-            "youtube": {"player_client": ["web"]}}}, use_cookies=True)
-        fmts = info.get("formats") or []
-        desc = ", ".join(
-            f"{f.get('format_id')}/{f.get('ext')}"
-            f"/a:{(f.get('acodec') or 'none')[:4]}"
-            f"/v:{(f.get('vcodec') or 'none')[:4]}"
-            f"/url:{'y' if f.get('url') else 'n'}"
-            for f in fmts[:18])
-        lines.append(f"formats via web: {len(fmts)} — {desc or 'NONE'}")
-    except YoutubeError as exc:
-        lines.append(f"formats via web: EXTRACT FAIL {str(exc)[:120]}")
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+    except Exception as exc:
+        return f"EXTRACT FAIL {str(exc)[:110]}"
+    fmts = (info or {}).get("formats") or []
+    desc = ", ".join(
+        f"{f.get('format_id')}/{f.get('ext')}"
+        f"/a:{(f.get('acodec') or 'none')[:4]}"
+        f"/url:{'y' if f.get('url') else 'n'}"
+        for f in fmts[:14])
+    return (f"{len(fmts)} formats, "
+            f"audio-only: {sum(1 for f in fmts if f.get('acodec') not in (None, 'none') and f.get('vcodec') in (None, 'none'))}"
+            f" — {desc or 'NONE'}")
+
+
+def self_test() -> str:
+    """Startup probe: dump the raw format lists YouTube returns for the
+    owner's test video (web+cookies vs android_vr cookieless), then try
+    the full /play path on a fresh search result."""
+    url = "https://www.youtube.com/watch?v=rfTgO9rpqck"
+    lines = [
+        "web+cookies: " + _raw_formats(url, ["web"], True),
+        "android_vr plain: " + _raw_formats(url, ["android_vr"], False),
+    ]
     try:
         track = search_tracks("Tum Hi Ho", limit=1)[0]
         resolve_stream(track)
@@ -196,13 +211,30 @@ def track_from_info(info: dict, requester_id: int, requester_name: str,
 
 def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
                   requester_name: str = "", dedication=None):
-    """YouTube search -> list[Track] (best match first)."""
-    info = _extract(f"ytsearch{limit}:{query}", {"noplaylist": True})
+    """YouTube search -> list[Track] (best match first).
+
+    extract_flat is ESSENTIAL: without it yt-dlp fully extracts the top
+    result's watch page right here — cookieless, default client — which
+    hits the bot wall before resolve_stream (cookies + PO token) ever
+    gets a chance. Flat entries already carry id/title/duration/uploader
+    from the search API; the real extraction happens later, in
+    resolve_stream.
+    """
+    info = _extract(f"ytsearch{limit}:{query}",
+                    {"noplaylist": True, "extract_flat": True})
     entries = info.get("entries") or []
-    return [
-        track_from_info(e, requester_id, requester_name, dedication)
-        for e in entries if e
-    ]
+    tracks = []
+    for e in entries:
+        if not e:
+            continue
+        e = dict(e)
+        if not e.get("thumbnail"):
+            thumbs = e.get("thumbnails") or []
+            if thumbs:
+                e["thumbnail"] = thumbs[-1].get("url", "")
+        tracks.append(track_from_info(e, requester_id, requester_name,
+                                      dedication))
+    return tracks
 
 
 def track_from_url(url: str, requester_id: int, requester_name: str,
