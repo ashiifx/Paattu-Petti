@@ -15,3 +15,7 @@ services:
         sync: false
       - key: YT_COOKIES
         sync: false
+      - key: DEEZER_ARL
+        sync: false
+      - key: YT_VIA_WARP
+        sync: false

@@ -11,6 +11,7 @@ import re
 
 import yt_dlp
 
+import config
 from queuestate import Track
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,11 @@ _BASE_OPTS = {
 }
 
 _AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
+
+if config.YT_VIA_WARP:
+    # All yt-dlp traffic leaves via the WARP tunnel (see run.sh).
+    # Saavn/Deezer use urllib directly and stay on the host IP.
+    _BASE_OPTS["proxy"] = config.WARP_PROXY
 
 _COOKIE_PATH = "/tmp/yt_cookies.txt"
 
@@ -177,16 +183,24 @@ def _raw_formats(url: str, clients, use_cookies: bool) -> str:
 def self_test() -> str:
     """Startup probe: one Saavn search (cheap, no YouTube calls — this
     host's IP is bot-walled there and extra extraction attempts only
-    tighten the flag)."""
+    tighten the flag), plus a Deezer decryption probe when an ARL is
+    configured."""
     try:
         import saavn
         tracks = saavn.search_tracks("Tum Hi Ho", limit=1)
         if tracks and tracks[0].stream_url:
-            return (f"SELFTEST OK — Saavn resolved {tracks[0].title!r} "
-                    f"with a direct stream URL")
-        return "SELFTEST FAIL — Saavn search returned no playable track"
+            verdict = (f"SELFTEST OK — Saavn resolved {tracks[0].title!r} "
+                       f"with a direct stream URL")
+        else:
+            verdict = "SELFTEST FAIL — Saavn search returned no playable track"
     except Exception as exc:
-        return f"SELFTEST FAIL — Saavn unreachable: {exc!r}"[:300]
+        verdict = f"SELFTEST FAIL — Saavn unreachable: {exc!r}"[:300]
+    if config.DEEZER_ARL:
+        import deezer
+        verdict += " | " + deezer.self_test()
+    if config.YT_VIA_WARP:
+        verdict += " | " + _warp_probe()
+    return verdict
 
 
 def track_from_info(info: dict, requester_id: int, requester_name: str,
@@ -264,6 +278,18 @@ def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
     except Exception:
         log.warning("Saavn search failed; trying other sources",
                     exc_info=True)
+    if config.DEEZER_ARL:
+        # Deezer: real originals incl. the English catalog Saavn lacks,
+        # and guaranteed playable (no DRM trap) once an ARL is set.
+        try:
+            import deezer
+            dz_tracks = deezer.search_tracks(query, limit, requester_id,
+                                             requester_name, dedication)
+            if dz_tracks:
+                return dz_tracks
+        except Exception:
+            log.warning("Deezer search failed; trying other sources",
+                        exc_info=True)
     try:
         sc_tracks = _soundcloud_search_tracks(query, limit, requester_id,
                                               requester_name, dedication)
@@ -401,8 +427,97 @@ def _soundcloud_stream(title: str):
     return _soundcloud_page_stream(top.get("webpage_url") or top.get("url"))
 
 
+def _prune_youtube_cache(cache: str, keep: int = 15) -> None:
+    try:
+        files = [os.path.join(cache, f) for f in os.listdir(cache)]
+        files.sort(key=os.path.getmtime)
+        for old in files[:-keep]:
+            os.unlink(old)
+    except Exception:
+        pass
+
+
+def _download_youtube_file(track: Track) -> None:
+    """Download a YouTube track's audio through the WARP tunnel to the
+    local cache and point track.file_path at it. Rotates client
+    identities like extraction does. Raises YoutubeError if every
+    client fails or produces an invalid file."""
+    import glob
+    from deezer import _validate_file
+    cache = os.path.join(config.DOWNLOAD_DIR, "youtube")
+    os.makedirs(cache, exist_ok=True)
+    for existing in glob.glob(os.path.join(cache, track.video_id + ".*")):
+        if _validate_file(existing):
+            track.file_path = existing
+            track.stream_resolved_at = time.time()
+            return
+    url = track.webpage_url or \
+        f"https://www.youtube.com/watch?v={track.video_id}"
+    errors = []
+    if _cookiefile():
+        client_sets = [["web"], ["web_safari"], ["mweb"]] + _CLIENT_SETS
+    else:
+        client_sets = _CLIENT_SETS
+    for clients in client_sets:
+        label = "+".join(clients) if clients else "default"
+        opts = {**_BASE_OPTS,
+                "format": _AUDIO_FORMAT,
+                "outtmpl": os.path.join(cache, track.video_id + ".%(ext)s"),
+                "noplaylist": True,
+                "overwrites": True}
+        if clients:
+            opts["extractor_args"] = {
+                "youtube": {"player_client": clients}}
+        cookiefile = _cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as exc:
+            errors.append(f"{label}: {str(exc)[:90]}")
+            continue
+        for path in glob.glob(os.path.join(cache, track.video_id + ".*")):
+            if _validate_file(path):
+                track.file_path = path
+                track.stream_resolved_at = time.time()
+                log.info("youtube download via tunnel ok (%s): %s",
+                         label, track.title)
+                _prune_youtube_cache(cache)
+                return
+        errors.append(f"{label}: no valid file produced")
+    raise YoutubeError("Tunnel download failed — " + " | ".join(errors[:3]))
+
+
+def _warp_probe() -> str:
+    """Boot-log verdict for the WARP route: one proxied extraction."""
+    try:
+        info = _extract("https://www.youtube.com/watch?v=rfTgO9rpqck",
+                        {"format": _AUDIO_FORMAT})
+        formats = info.get("formats") or []
+        audio = [f for f in formats
+                 if f.get("acodec") not in (None, "none")]
+        if audio or info.get("url"):
+            return (f"WARP OK — YouTube served playable audio via the "
+                    f"tunnel ({info.get('title')!r})")
+        return ("WARP FAIL — tunnel answered but YouTube still served "
+                "no audio formats (storyboard wall)")
+    except Exception as exc:
+        return f"WARP FAIL — {str(exc)[:170]}"
+
+
 def resolve_stream(track: Track) -> Track:
     """Fetch the direct audio URL for a track (mutates and returns it)."""
+    if track.source == "deezer":
+        # Downloads + decrypts to a local file; sets track.file_path.
+        import deezer
+        try:
+            deezer.resolve_stream(track)
+        except deezer.DeezerError as exc:
+            raise YoutubeError(str(exc)) from exc
+        import time
+        track.stream_resolved_at = time.time()
+        return track
     if track.source == "saavn":
         # Saavn tracks carry their direct CDN URL from search time; the
         # links are static, so just refresh the freshness stamp.
@@ -449,6 +564,16 @@ def resolve_stream(track: Track) -> Track:
         track.stream_url = chosen["url"]
         track.stream_resolved_at = time.time()
         return track
+    if config.YT_VIA_WARP and track.video_id:
+        # The stream URL would be bound to the WARP egress IP and the
+        # player could not fetch it from here — download the file
+        # through the tunnel instead and stream it locally.
+        try:
+            _download_youtube_file(track)
+            return track
+        except YoutubeError as exc:
+            log.warning("WARP download failed for %r: %s — trying "
+                        "direct extraction", track.title, exc)
     target = track.webpage_url or track.video_id
     if not target:
         raise YoutubeError("Track has no YouTube reference to stream from.")

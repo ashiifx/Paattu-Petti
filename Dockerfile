@@ -1,30 +1,30 @@
 FROM python:3.12-slim
 
 # ffmpeg: required by py-tgcalls for streaming and by the audio effects.
-# Node 22 + git: the bgutil PO-token provider server (see below). Node 22
-# is required — the server's jsdom stack does require() of ES modules,
-# which Node 20 refuses (ERR_REQUIRE_ESM crash-loop).
+# Node and the bgutil PO-token server used to be built here too, but
+# run.sh no longer starts that server (YouTube IP-walls this host
+# regardless), and building it (npm install + tsc) was the slowest
+# part of every deploy — minutes of bot downtime per upload, for a
+# component nothing runs. The yt-dlp plugin stays in requirements.txt
+# (harmless without a server; the laptop setup can run one manually).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg git curl ca-certificates \
-    && curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz -o /tmp/node.tar.gz \
-    && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
-    && rm /tmp/node.tar.gz \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# WARP egress tools (used only when YT_VIA_WARP=1; see run.sh): wgcf
+# registers a free Cloudflare WARP account at boot, wireproxy turns it
+# into a local SOCKS5 proxy in userspace — no root or TUN device.
+RUN curl -fsSL https://github.com/ViRb3/wgcf/releases/download/v2.3.1/wgcf_2.3.1_linux_amd64 -o /usr/local/bin/wgcf \
+    && curl -fsSL https://github.com/pufferffish/wireproxy/releases/download/v1.0.9/wireproxy_linux_amd64.tar.gz -o /tmp/wireproxy.tar.gz \
+    && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin \
+    && rm /tmp/wireproxy.tar.gz \
+    && chmod +x /usr/local/bin/wgcf /usr/local/bin/wireproxy
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-# bgutil PO-token provider server, version-matched with the pip plugin in
-# requirements.txt (2.0.2). YouTube demands a PO token for playback from
-# datacenter IPs; this server generates them locally on port 4416 and the
-# yt-dlp plugin picks them up automatically.
-RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
-    && cd /opt/bgutil/server \
-    && npm install \
-    && npx tsc
 
 COPY . .
 

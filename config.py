@@ -25,6 +25,19 @@ except ValueError:
 DB_PATH = os.environ.get("DB_PATH", "paattu_petti.db")
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "downloads")
 
+# Deezer ARL cookie (login-equivalent!) enabling the Deezer source for
+# full-track streaming. Optional: without it the Deezer source is off.
+DEEZER_ARL = os.environ.get("DEEZER_ARL", "").strip()
+
+# Route yt-dlp (YouTube/SoundCloud) through a local Cloudflare WARP
+# tunnel (wireproxy, started by run.sh) so YouTube sees a Cloudflare
+# egress IP instead of this host's burned one. YouTube tracks are then
+# DOWNLOADED through the tunnel and streamed as local files (stream
+# URLs are bound to the egress IP, so direct playback would 403).
+YT_VIA_WARP = os.environ.get("YT_VIA_WARP", "").strip().lower() \
+    in ("1", "true", "yes")
+WARP_PROXY = os.environ.get("WARP_PROXY", "socks5://127.0.0.1:40001")
+
 # Playback limits
 MAX_TRACK_SECONDS = 30 * 60          # reject tracks longer than 30 minutes
 MAX_QUEUE_PER_USER = 5               # upcoming tracks per user, per group
