@@ -10,12 +10,14 @@ StreamEnded update for the replaced stream is ignored exactly once.
 import asyncio
 import logging
 import os
+import time
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pytgcalls import PyTgCalls
 from pytgcalls.types import GroupCallConfig, MediaStream
 
 import config
+import saavn
 import youtube
 from queuestate import ChatState, Track
 from utils import format_duration
@@ -43,6 +45,7 @@ class PlayerManager:
         self._locks = {}              # chat_id -> asyncio.Lock
         self._leave_tasks = {}        # chat_id -> asyncio.Task
         self._prefetch_tasks = {}     # chat_id -> asyncio.Task
+        self._member_attempts = {}    # chat_id -> last auto-join attempt ts
 
     # ------------------------------------------------------------ state helpers
 
@@ -90,19 +93,54 @@ class PlayerManager:
                 await self._play_current(chat_id, state)
 
     def _media_stream(self, state: ChatState, track: Track) -> MediaStream:
-        path = track.file_path if track.source == "file" else track.stream_url
+        path = track.file_path or track.stream_url
         kwargs = {}
         if state.effect and EFFECTS.get(state.effect):
             kwargs["ffmpeg_parameters"] = EFFECTS[state.effect]
         return MediaStream(path, video_flags=MediaStream.Flags.IGNORE, **kwargs)
+
+    async def _ensure_assistant_member(self, chat_id: int):
+        """The assistant can only stream into groups it belongs to. If it
+        isn't a member, invite it with a bot-exported link and join —
+        no manual adding by the owner. Throttled to one attempt per
+        chat per 2 minutes; needs the bot to be admin with invite
+        rights, which is the setup the owner already runs."""
+        now = time.time()
+        if now - self._member_attempts.get(chat_id, 0) < 120:
+            return
+        self._member_attempts[chat_id] = now
+        try:
+            await self.assistant.get_chat_member(chat_id, "me")
+            return  # already a member
+        except Exception:
+            pass
+        try:
+            link = await self.bot.export_chat_invite_link(chat_id)
+        except Exception:
+            log.warning("auto-join: bot cannot export an invite link for "
+                        "%s (bot needs to be admin with invite rights)",
+                        chat_id)
+            return
+        try:
+            await self.assistant.join_chat(link)
+            log.info("auto-join: assistant joined chat %s", chat_id)
+        except Exception:
+            log.warning("auto-join: assistant failed to join %s",
+                        chat_id, exc_info=True)
 
     async def _play_current(self, chat_id: int, state: ChatState):
         """Resolve + stream state.current. Caller must hold the chat lock."""
         track = state.current
         if track is None:
             return
-        if track.source == "youtube" and not track.stream_fresh():
+        await self._ensure_assistant_member(chat_id)
+        if track.source in ("youtube", "soundcloud") \
+                and not track.stream_fresh():
             await self._run(youtube.resolve_stream, track)
+        elif track.source == "saavn" and not track.file_path:
+            # Best-effort: a local file streams far more smoothly than a
+            # remote URL on the free tier. Falls back to the URL.
+            await self._run(saavn.download_track, track)
         try:
             await self.call.play(
                 chat_id,
@@ -287,7 +325,7 @@ class PlayerManager:
         if not state.queue:
             return
         nxt = state.queue[0]
-        if nxt.source != "youtube" or nxt.stream_fresh():
+        if nxt.source not in ("youtube", "soundcloud") or nxt.stream_fresh():
             return
 
         async def _prefetch():

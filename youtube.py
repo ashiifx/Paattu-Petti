@@ -7,6 +7,7 @@ Only metadata + direct stream URLs are extracted; nothing is downloaded
 
 import logging
 import os
+import re
 
 import yt_dlp
 
@@ -203,23 +204,101 @@ def track_from_info(info: dict, requester_id: int, requester_name: str,
     )
 
 
+_STOP_WORDS = {"the", "of", "to", "in", "on", "a", "an", "by", "and",
+               "or", "from", "with", "song", "songs", "full", "video",
+               "audio", "lyrics", "lyrical"}
+_JUNK_TAGS = ("nightcore", "sped up", "sped-up", "slowed", "reverb",
+              "8d audio", "bass boosted", "chipmunk", "karaoke",
+              "instrumental", "ringtone", "cover")
+
+
+def _saavn_confident(query: str, track) -> bool:
+    """Decide whether Saavn's top hit is really the song asked for.
+    Saavn's weak spot is English queries, where its first result is
+    often a cover or a nightcore/sped-up upload by someone else.
+    Rules: a junk-version tag in the title that the query didn't ask
+    for disqualifies; at least half the query's words must appear in
+    the title; and any remaining query words (usually the artist's
+    name) must show up in the artist field."""
+    q = query.lower()
+    title = track.title.lower()
+    if any(tag in title for tag in _JUNK_TAGS if tag not in q):
+        return False
+    words = [w for w in re.findall(r"[a-z0-9]+", q)
+             if len(w) > 1 and w not in _STOP_WORDS]
+    if not words:
+        return True
+    title_words = set(re.findall(r"[a-z0-9]+", title))
+    artist_words = set(re.findall(r"[a-z0-9]+",
+                                  (track.uploader or "").lower()))
+    in_title = [w for w in words if w in title_words]
+    rest = [w for w in words if w not in title_words]
+    if len(in_title) / len(words) < 0.5:
+        return False
+    if rest and not any(w in artist_words for w in rest):
+        return False
+    return True
+
+
 def search_tracks(query: str, limit: int = 1, requester_id: int = 0,
                   requester_name: str = "", dedication=None):
-    """Search -> list[Track] (best match first). JioSaavn first: its
-    catalog API works from server IPs (YouTube bot-walls this host even
-    with cookies + PO tokens) and is strongest for Indian music.
-    YouTube (flat search) is the fallback for anything Saavn lacks.
-    """
+    """Search -> list[Track] (best match first). Order: JioSaavn when
+    its top hit actually matches the query (its catalog API works from
+    server IPs and is strongest for Indian music), then SoundCloud
+    (also server-friendly; carries much of the English catalog Saavn
+    lacks), then YouTube as the last resort (bot-walled from this
+    host, kept for hosts where it works)."""
+    saavn_tracks = []
     try:
         import saavn
-        tracks = saavn.search_tracks(query, limit, requester_id,
-                                     requester_name, dedication)
-        if tracks:
-            return tracks
+        saavn_tracks = saavn.search_tracks(query, limit, requester_id,
+                                           requester_name, dedication)
+        if saavn_tracks and _saavn_confident(query, saavn_tracks[0]):
+            return saavn_tracks
     except Exception:
-        log.warning("Saavn search failed; trying YouTube", exc_info=True)
+        log.warning("Saavn search failed; trying other sources",
+                    exc_info=True)
+    try:
+        sc_tracks = _soundcloud_search_tracks(query, limit, requester_id,
+                                              requester_name, dedication)
+        if sc_tracks:
+            return sc_tracks
+    except YoutubeError:
+        pass
+    try:
+        yt_tracks = _youtube_search_tracks(query, limit, requester_id,
+                                           requester_name, dedication)
+        if yt_tracks:
+            return yt_tracks
+    except YoutubeError:
+        pass
+    # Last resort: Saavn's weak hit (often a cover for English queries)
+    # still beats an error in a listening group.
+    if saavn_tracks:
+        return saavn_tracks
     return _youtube_search_tracks(query, limit, requester_id,
                                   requester_name, dedication)
+
+
+def _soundcloud_search_tracks(query: str, limit: int, requester_id: int,
+                              requester_name: str, dedication=None):
+    """SoundCloud search (flat) -> list[Track]; streams resolve lazily
+    in resolve_stream via _soundcloud_page_stream."""
+    info = _extract(f"scsearch{limit}:{query}",
+                    {"noplaylist": True, "extract_flat": True})
+    tracks = []
+    for e in (info.get("entries") or []):
+        if not e:
+            continue
+        e = dict(e)
+        if not e.get("thumbnail"):
+            thumbs = e.get("thumbnails") or []
+            if thumbs:
+                e["thumbnail"] = thumbs[-1].get("url", "")
+        track = track_from_info(e, requester_id, requester_name, dedication)
+        track.source = "soundcloud"
+        tracks.append(track)
+    return tracks
 
 
 def _youtube_search_tracks(query: str, limit: int = 1, requester_id: int = 0,
@@ -283,6 +362,25 @@ def playlist_tracks(url: str, limit: int, requester_id: int,
     return tracks
 
 
+def _soundcloud_page_stream(page_url: str):
+    """Best direct stream URL from a SoundCloud track page, or None.
+    Prefers a plain progressive file over HLS when both exist."""
+    if not page_url:
+        return None
+    try:
+        full = _extract(page_url, {})
+    except YoutubeError:
+        return None
+    formats = [f for f in (full.get("formats") or []) if f.get("url")]
+    if not formats:
+        return None
+    progressive = [f for f in formats
+                   if "m3u8" not in (f.get("protocol") or "")
+                   and "m3u8" not in f.get("url", "")]
+    chosen = progressive[-1] if progressive else formats[-1]
+    return chosen["url"]
+
+
 def _soundcloud_stream(title: str):
     """Fallback: find the song on SoundCloud (no bot wall there) and
     return a direct stream URL, or None."""
@@ -294,19 +392,7 @@ def _soundcloud_stream(title: str):
     if not entries:
         return None
     top = entries[0]
-    try:
-        full = _extract(top.get("webpage_url") or top.get("url"), {})
-    except YoutubeError:
-        return None
-    formats = [f for f in (full.get("formats") or []) if f.get("url")]
-    if not formats:
-        return None
-    # Prefer a plain progressive file over HLS when both exist.
-    progressive = [f for f in formats
-                   if "m3u8" not in (f.get("protocol") or "")
-                   and "m3u8" not in f.get("url", "")]
-    chosen = progressive[-1] if progressive else formats[-1]
-    return chosen["url"]
+    return _soundcloud_page_stream(top.get("webpage_url") or top.get("url"))
 
 
 def resolve_stream(track: Track) -> Track:
@@ -315,6 +401,15 @@ def resolve_stream(track: Track) -> Track:
         # Saavn tracks carry their direct CDN URL from search time; the
         # links are static, so just refresh the freshness stamp.
         import time
+        track.stream_resolved_at = time.time()
+        return track
+    if track.source == "soundcloud":
+        import time
+        stream = _soundcloud_page_stream(track.webpage_url)
+        if not stream:
+            raise YoutubeError(
+                "Could not get a playable stream from SoundCloud.")
+        track.stream_url = stream
         track.stream_resolved_at = time.time()
         return track
     target = track.webpage_url or track.video_id
